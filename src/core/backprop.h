@@ -3,6 +3,10 @@
 
 #include "triangle.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     int input_size;
     int hidden_size;
@@ -39,5 +43,9 @@ void backprop_print_logs(const BackpropTrainer *trainer);
 void backprop_save_model(const BackpropTrainer *trainer, const char *filename);
 BackpropTrainer *backprop_load_model(const char *filename);
 TriangleChain *backprop_reduce_vocab(const TriangleChain *chain, int top_n);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
