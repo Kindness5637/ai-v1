@@ -359,7 +359,8 @@ int main(int argc, char *argv[]) {
                         }
                     }
                     candidate_scores[i] = -candidate_distances[i] +
-                        0.75 * log(1.0 + occurrence) + 0.50 * neighbors;
+                        0.75 * log(1.0 + occurrence) +
+                        0.50 * log(1.0 + neighbors);
                 }
                 for (size_t i = 1; i < candidate_count; i++) {
                     int id = candidate_ids[i];
@@ -465,7 +466,8 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         candidate_scores[c] = -distance +
-                            0.75 * log(1.0 + occurrence) + 0.50 * neighbors;
+                            0.75 * log(1.0 + occurrence) +
+                            0.50 * log(1.0 + neighbors);
                         if (candidate_ids[c] == target_id) target_score = candidate_scores[c];
                     }
                     int found = 0;
