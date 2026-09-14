@@ -50,7 +50,7 @@ void print_usage(void) {
     printf("  ./triangle.out <file> -context-query <a> <b> - Query ordered context\n");
     printf("  ./triangle.out <file> -predict <a> <b> - Rank graph candidates neurally\n");
     printf("  ./triangle.out <file> -evaluate-context [n] - Evaluate rotations\n");
-    printf("  ./triangle.out <train> -heldout <test> - Train/evaluate by document\n");
+    printf("  ./triangle.out <train> -heldout <test> [train2 ...] - Multi-document held-out experiment\n");
     printf("  ./triangle.out <old> -learn <new>  - Learn from new text using old as base\n");
     printf("  ./triangle.out <file> -backprop    - Train with backpropagation\n");
 }
@@ -590,7 +590,42 @@ int main(int argc, char *argv[]) {
             global_chain->owns_vocab = 0;
             free_triangles(global_chain);
 
-            TriangleChain *train_chain = create_triangles_with_vocab(file_content, shared_vocab);
+            /* Combine the primary training document with any additional
+             * training documents listed after the held-out test file. */
+            size_t train_size = strlen(file_content);
+            char *combined_train = malloc(train_size + 1);
+            if (combined_train) {
+                memcpy(combined_train, file_content, train_size);
+                combined_train[train_size] = '\0';
+            }
+            for (int arg = 4; combined_train && arg < argc; arg++) {
+                char *extra_content = read_file(argv[arg]);
+                if (!extra_content) {
+                    fprintf(stderr, "Unable to read additional training file: %s\n", argv[arg]);
+                    free(combined_train);
+                    combined_train = NULL;
+                    break;
+                }
+                size_t extra_size = strlen(extra_content);
+                char *expanded = realloc(combined_train,
+                                         train_size + 1 + extra_size + 1);
+                if (!expanded) {
+                    free(extra_content);
+                    free(combined_train);
+                    combined_train = NULL;
+                    break;
+                }
+                combined_train = expanded;
+                combined_train[train_size] = ' ';
+                memcpy(combined_train + train_size + 1, extra_content, extra_size + 1);
+                train_size += 1 + extra_size;
+                free(extra_content);
+            }
+
+            TriangleChain *train_chain = combined_train
+                ? create_triangles_with_vocab(combined_train, shared_vocab)
+                : NULL;
+            free(combined_train);
             TriangleChain *test_chain = create_triangles_with_vocab(test_content, shared_vocab);
             if (!train_chain || !test_chain) {
                 fprintf(stderr, "Failed to create shared-vocabulary train/test chains\n");
@@ -602,6 +637,7 @@ int main(int argc, char *argv[]) {
                 printf("Training triangles: %zu\n", train_chain->count);
                 printf("Held-out triangles: %zu\n", test_chain->count);
                 printf("Shared vocabulary: %zu words\n", shared_vocab->count);
+                printf("Training documents: %d\n", argc - 3);
                 BackpropTrainer *trainer = backprop_create(
                     (int)shared_vocab->count, 32, 128, 96, 50, 0.1);
                 if (!trainer || backprop_train_cuda(trainer, train_chain, 2) != 0) {
