@@ -83,6 +83,7 @@ static void evaluate_context_model(BackpropTrainer *trainer,
     }
     if (limit > chain->count) limit = chain->count;
     int graph_hits = 0, neural_top1 = 0, neural_top5 = 0, total = 0;
+    int pair_queries = 0;
     int candidate_ids[256];
     int embed_dim = trainer->network->embed_dim;
     double *input = calloc(2 * embed_dim, sizeof(double));
@@ -97,6 +98,7 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                 graph, first_id, second_id, candidate_ids, 256);
             total++;
             if (count == 0) continue;
+            pair_queries++;
             ContextCandidate evidence[256];
             size_t evidence_count = context_graph_collect_candidate_evidence(
                 graph, first_id, second_id, evidence, 256);
@@ -145,6 +147,16 @@ static void evaluate_context_model(BackpropTrainer *trainer,
         printf("Graph recall: %.1f%%\n", 100.0 * graph_hits / total);
         printf("Neural top-1: %.1f%%\n", 100.0 * neural_top1 / total);
         printf("Neural top-5: %.1f%%\n", 100.0 * neural_top5 / total);
+        printf("Pair coverage: %.1f%% (%d/%d)\n",
+               100.0 * pair_queries / total, pair_queries, total);
+        if (pair_queries > 0) {
+            printf("Conditional graph recall: %.1f%%\n",
+                   100.0 * graph_hits / pair_queries);
+            printf("Conditional neural top-1: %.1f%%\n",
+                   100.0 * neural_top1 / pair_queries);
+            printf("Conditional neural top-5: %.1f%%\n",
+                   100.0 * neural_top5 / pair_queries);
+        }
     }
     free(input);
     free(output);
