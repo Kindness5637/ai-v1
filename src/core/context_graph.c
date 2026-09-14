@@ -203,3 +203,33 @@ void context_graph_query(const ContextGraph *graph, const TriangleChain *chain,
         printf("Found %zu matching context(s).\n", matches);
     }
 }
+
+size_t context_graph_collect_candidates(const ContextGraph *graph,
+                                        int first_word_id, int second_word_id,
+                                        int *candidate_ids, size_t max_candidates) {
+    if (!graph || !candidate_ids || max_candidates == 0) return 0;
+    size_t count = 0;
+    for (size_t i = 0; i < graph->node_count && count < max_candidates; i++) {
+        const ContextNode *node = &graph->nodes[i];
+        if (node->type != CONTEXT_TRIANGLE_NODE ||
+            node->word_ids[0] != first_word_id ||
+            node->word_ids[1] != second_word_id) continue;
+
+        int candidates[2] = {node->word_ids[2], 0};
+        /* Neighbor bonds preserve the same rotation three context nodes later. */
+        if (node->id + 3 <= (int)graph->node_count &&
+            graph->nodes[node->id + 2].type == CONTEXT_TRIANGLE_NODE) {
+            const ContextNode *neighbor = &graph->nodes[node->id + 2];
+            candidates[1] = neighbor->word_ids[2];
+        }
+        for (int c = 0; c < 2; c++) {
+            if (candidates[c] <= 0) continue;
+            int exists = 0;
+            for (size_t j = 0; j < count; j++) {
+                if (candidate_ids[j] == candidates[c]) exists = 1;
+            }
+            if (!exists && count < max_candidates) candidate_ids[count++] = candidates[c];
+        }
+    }
+    return count;
+}

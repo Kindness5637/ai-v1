@@ -49,6 +49,7 @@ void print_usage(void) {
     printf("  ./triangle.out <file> -context-graph - Build rotated context graph\n");
     printf("  ./triangle.out <file> -context-query <a> <b> - Query ordered context\n");
     printf("  ./triangle.out <file> -predict <a> <b> - Rank graph candidates neurally\n");
+    printf("  ./triangle.out <file> -evaluate-context [n] - Evaluate rotations\n");
     printf("  ./triangle.out <old> -learn <new>  - Learn from new text using old as base\n");
     printf("  ./triangle.out <file> -backprop    - Train with backpropagation\n");
 }
@@ -114,7 +115,8 @@ int main(int argc, char *argv[]) {
                       strcmp(argv[2], "-train") != 0 &&
                       strcmp(argv[2], "-context-graph") != 0 &&
                       strcmp(argv[2], "-context-query") != 0 &&
-                      strcmp(argv[2], "-predict") != 0)) {
+                      strcmp(argv[2], "-predict") != 0 &&
+                      strcmp(argv[2], "-evaluate-context") != 0)) {
         print_triangles(chain);
     }
 
@@ -369,6 +371,85 @@ int main(int argc, char *argv[]) {
                 free(input);
                 free(output);
             }
+            context_graph_free(context_graph);
+            backprop_free(trainer);
+        }
+    } else if (argc > 2 && strcmp(argv[2], "-evaluate-context") == 0) {
+        size_t limit = 100;
+        if (argc > 3) {
+            int requested = atoi(argv[3]);
+            if (requested > 0) limit = (size_t)requested;
+        }
+        if (limit > chain->count) limit = chain->count;
+
+        BackpropTrainer *trainer = backprop_load_model("backprop_model.bin");
+        ContextGraph *context_graph = context_graph_create(chain);
+        if (!trainer || !context_graph) {
+            fprintf(stderr, "Need backprop_model.bin and a context graph\n");
+            backprop_free(trainer);
+            context_graph_free(context_graph);
+        } else {
+            int graph_hits = 0;
+            int neural_top1 = 0;
+            int neural_top5 = 0;
+            int total = 0;
+            int candidate_ids[256];
+            int embed_dim = trainer->network->embed_dim;
+            double *input = calloc(2 * embed_dim, sizeof(double));
+            double *output = calloc(trainer->network->output_size, sizeof(double));
+
+            for (size_t t = 0; t < limit; t++) {
+                for (int rotation = 0; rotation < 3; rotation++) {
+                    int first_id = chain->triangles[t].word_ids[rotation];
+                    int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+                    int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+                    size_t candidate_count = context_graph_collect_candidates(
+                        context_graph, first_id, second_id, candidate_ids, 256);
+                    if (candidate_count == 0) continue;
+                    total++;
+                    int target_rank = 0;
+                    double target_distance = 0.0;
+                    for (int d = 0; d < embed_dim; d++) {
+                        input[d] = trainer->network->embeddings[(first_id - 1) * embed_dim + d];
+                        input[embed_dim + d] = trainer->network->embeddings[(second_id - 1) * embed_dim + d];
+                    }
+                    backprop_predict(trainer, input, output);
+                    for (size_t c = 0; c < candidate_count; c++) {
+                        double distance = 0.0;
+                        for (int d = 0; d < embed_dim; d++) {
+                            double delta = output[2 * embed_dim + d] -
+                                trainer->network->embeddings[(candidate_ids[c] - 1) * embed_dim + d];
+                            distance += delta * delta;
+                        }
+                        if (candidate_ids[c] == target_id) target_distance = distance;
+                    }
+                    for (size_t c = 0; c < candidate_count; c++) {
+                        double distance = 0.0;
+                        for (int d = 0; d < embed_dim; d++) {
+                            double delta = output[2 * embed_dim + d] -
+                                trainer->network->embeddings[(candidate_ids[c] - 1) * embed_dim + d];
+                            distance += delta * delta;
+                        }
+                        if (distance < target_distance) target_rank++;
+                    }
+                    int found = 0;
+                    for (size_t c = 0; c < candidate_count; c++) {
+                        if (candidate_ids[c] == target_id) found = 1;
+                    }
+                    graph_hits += found;
+                    neural_top1 += found && target_rank == 0;
+                    neural_top5 += found && target_rank < 5;
+                }
+            }
+            printf("\n=== Context Evaluation (%zu triangles) ===\n", limit);
+            printf("Rotation queries: %d\n", total);
+            if (total > 0) {
+                printf("Graph recall: %.1f%%\n", 100.0 * graph_hits / total);
+                printf("Neural top-1: %.1f%%\n", 100.0 * neural_top1 / total);
+                printf("Neural top-5: %.1f%%\n", 100.0 * neural_top5 / total);
+            }
+            free(input);
+            free(output);
             context_graph_free(context_graph);
             backprop_free(trainer);
         }
