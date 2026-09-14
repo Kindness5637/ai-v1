@@ -50,6 +50,7 @@ void print_usage(void) {
     printf("  ./triangle.out <file> -context-query <a> <b> - Query ordered context\n");
     printf("  ./triangle.out <file> -predict <a> <b> - Rank graph candidates neurally\n");
     printf("  ./triangle.out <file> -evaluate-context [n] - Evaluate rotations\n");
+    printf("  ./triangle.out <train> -heldout <test> - Train/evaluate by document\n");
     printf("  ./triangle.out <old> -learn <new>  - Learn from new text using old as base\n");
     printf("  ./triangle.out <file> -backprop    - Train with backpropagation\n");
 }
@@ -71,6 +72,83 @@ static int nearest_word_id(const BackpropNetwork *network, const double *vector)
     }
 
     return best + 1;
+}
+
+static void evaluate_context_model(BackpropTrainer *trainer,
+                                   const TriangleChain *chain, size_t limit) {
+    ContextGraph *graph = context_graph_create(chain);
+    if (!graph) {
+        printf("Unable to create evaluation context graph.\n");
+        return;
+    }
+    if (limit > chain->count) limit = chain->count;
+    int graph_hits = 0, neural_top1 = 0, neural_top5 = 0, total = 0;
+    int candidate_ids[256];
+    int embed_dim = trainer->network->embed_dim;
+    double *input = calloc(2 * embed_dim, sizeof(double));
+    double *output = calloc(trainer->network->output_size, sizeof(double));
+
+    for (size_t t = 0; t < limit; t++) {
+        for (int rotation = 0; rotation < 3; rotation++) {
+            int first_id = chain->triangles[t].word_ids[rotation];
+            int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+            int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+            size_t count = context_graph_collect_candidates(
+                graph, first_id, second_id, candidate_ids, 256);
+            if (count == 0) continue;
+            ContextCandidate evidence[256];
+            size_t evidence_count = context_graph_collect_candidate_evidence(
+                graph, first_id, second_id, evidence, 256);
+            for (int d = 0; d < embed_dim; d++) {
+                input[d] = trainer->network->embeddings[(first_id - 1) * embed_dim + d];
+                input[embed_dim + d] = trainer->network->embeddings[(second_id - 1) * embed_dim + d];
+            }
+            backprop_predict(trainer, input, output);
+            double scores[256];
+            double target_score = -INFINITY;
+            int found = 0;
+            for (size_t c = 0; c < count; c++) {
+                double distance = 0.0;
+                for (int d = 0; d < embed_dim; d++) {
+                    double delta = output[2 * embed_dim + d] -
+                        trainer->network->embeddings[(candidate_ids[c] - 1) * embed_dim + d];
+                    distance += delta * delta;
+                }
+                int occurrence = 0, neighbors = 0;
+                for (size_t e = 0; e < evidence_count; e++) {
+                    if (evidence[e].word_id == candidate_ids[c]) {
+                        occurrence = evidence[e].occurrence_count;
+                        neighbors = evidence[e].neighbor_count;
+                        break;
+                    }
+                }
+                scores[c] = -distance + 0.75 * log(1.0 + occurrence) +
+                    0.50 * log(1.0 + neighbors);
+                if (candidate_ids[c] == target_id) {
+                    found = 1;
+                    target_score = scores[c];
+                }
+            }
+            if (found) {
+                int rank = 0;
+                for (size_t c = 0; c < count; c++) if (scores[c] > target_score) rank++;
+                graph_hits++;
+                neural_top1 += rank == 0;
+                neural_top5 += rank < 5;
+            }
+            total++;
+        }
+    }
+    printf("\n=== Context Evaluation (%zu triangles) ===\n", limit);
+    printf("Rotation queries: %d\n", total);
+    if (total > 0) {
+        printf("Graph recall: %.1f%%\n", 100.0 * graph_hits / total);
+        printf("Neural top-1: %.1f%%\n", 100.0 * neural_top1 / total);
+        printf("Neural top-5: %.1f%%\n", 100.0 * neural_top5 / total);
+    }
+    free(input);
+    free(output);
+    context_graph_free(graph);
 }
 
 int main(int argc, char *argv[]) {
@@ -116,7 +194,8 @@ int main(int argc, char *argv[]) {
                       strcmp(argv[2], "-context-graph") != 0 &&
                       strcmp(argv[2], "-context-query") != 0 &&
                       strcmp(argv[2], "-predict") != 0 &&
-                      strcmp(argv[2], "-evaluate-context") != 0)) {
+                      strcmp(argv[2], "-evaluate-context") != 0 &&
+                      strcmp(argv[2], "-heldout") != 0)) {
         print_triangles(chain);
     }
 
@@ -496,6 +575,48 @@ int main(int argc, char *argv[]) {
             free(output);
             context_graph_free(context_graph);
             backprop_free(trainer);
+        }
+    } else if (argc > 3 && strcmp(argv[2], "-heldout") == 0) {
+        char *all_content = read_file("data/combined_all.txt");
+        char *test_content = read_file(argv[3]);
+        TriangleChain *global_chain = all_content ? create_triangles(all_content) : NULL;
+        if (!global_chain || !test_content) {
+            fprintf(stderr, "Held-out experiment requires data/combined_all.txt and a test file\n");
+            free(test_content);
+            free(all_content);
+            free_triangles(global_chain);
+        } else {
+            Vocabulary *shared_vocab = global_chain->vocab;
+            global_chain->vocab = NULL;
+            global_chain->owns_vocab = 0;
+            free_triangles(global_chain);
+
+            TriangleChain *train_chain = create_triangles_with_vocab(file_content, shared_vocab);
+            TriangleChain *test_chain = create_triangles_with_vocab(test_content, shared_vocab);
+            if (!train_chain || !test_chain) {
+                fprintf(stderr, "Failed to create shared-vocabulary train/test chains\n");
+                free_triangles(train_chain);
+                free_triangles(test_chain);
+                vocab_free(shared_vocab);
+            } else {
+                printf("\n=== Held-out Experiment ===\n");
+                printf("Training triangles: %zu\n", train_chain->count);
+                printf("Held-out triangles: %zu\n", test_chain->count);
+                printf("Shared vocabulary: %zu words\n", shared_vocab->count);
+                BackpropTrainer *trainer = backprop_create(
+                    (int)shared_vocab->count, 32, 128, 96, 50, 0.1);
+                if (!trainer || backprop_train_cuda(trainer, train_chain, 2) != 0) {
+                    fprintf(stderr, "Held-out CUDA training failed\n");
+                    backprop_free(trainer);
+                } else {
+                    backprop_save_model(trainer, "backprop_model_heldout.bin");
+                    evaluate_context_model(trainer, test_chain, 100);
+                    backprop_free(trainer);
+                }
+                free_triangles(train_chain);
+                free_triangles(test_chain);
+                vocab_free(shared_vocab);
+            }
         }
     } else if (argc > 2 && strcmp(argv[2], "-learn") == 0) {
         if (argc < 4) {

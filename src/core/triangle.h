@@ -15,9 +15,11 @@ typedef struct {
     size_t count;
     Vocabulary *vocab;
     WordRegistry *registry;
+    int owns_vocab;
 } TriangleChain;
 
 TriangleChain *create_triangles(const char *sentence);
+TriangleChain *create_triangles_with_vocab(const char *sentence, Vocabulary *vocab);
 void free_triangles(TriangleChain *chain);
 void print_triangles(const TriangleChain *chain);
 void print_vocabulary(const TriangleChain *chain);

@@ -62,6 +62,7 @@ TriangleChain *create_triangles(const char *sentence) {
 
     chain->vocab = vocab_create();
     chain->registry = registry_create();
+    chain->owns_vocab = 1;
     if (!chain->vocab || !chain->registry) {
         vocab_free(chain->vocab);
         registry_free(chain->registry);
@@ -108,6 +109,29 @@ TriangleChain *create_triangles(const char *sentence) {
     return chain;
 }
 
+TriangleChain *create_triangles_with_vocab(const char *sentence, Vocabulary *vocab) {
+    if (!vocab) return NULL;
+    TriangleChain *chain = create_triangles(sentence);
+    if (!chain) return NULL;
+
+    Vocabulary *local_vocab = chain->vocab;
+    for (size_t i = 0; i < chain->count; i++) {
+        for (int p = 0; p < 3; p++) {
+            if (chain->triangles[i].word_ids[p] <= 0) continue;
+            chain->triangles[i].word_ids[p] =
+                vocab_get_or_add(vocab, chain->triangles[i].words[p]);
+        }
+    }
+    for (size_t i = 0; i < chain->registry->count; i++) {
+        chain->registry->entries[i].word_id =
+            vocab_get_or_add(vocab, chain->registry->entries[i].word);
+    }
+    vocab_free(local_vocab);
+    chain->vocab = vocab;
+    chain->owns_vocab = 0;
+    return chain;
+}
+
 void free_triangles(TriangleChain *chain) {
     if (!chain) return;
     for (size_t i = 0; i < chain->count; i++) {
@@ -116,7 +140,7 @@ void free_triangles(TriangleChain *chain) {
         }
     }
     free(chain->triangles);
-    vocab_free(chain->vocab);
+    if (chain->owns_vocab) vocab_free(chain->vocab);
     registry_free(chain->registry);
     free(chain);
 }
