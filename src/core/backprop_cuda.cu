@@ -37,7 +37,7 @@ __global__ static void train_kernel(
     const double *weights_ih, const double *weights_ho,
     const double *bias_h, const double *bias_o,
     double *grad_ih, double *grad_ho, double *grad_bias_h,
-    double *grad_bias_o, double *loss,
+    double *grad_bias_o, double *grad_embeddings, double *loss,
     int triangle_count, int sample_start, int sample_end,
     int embed_dim, int input_size, int hidden_size, int output_size,
     int vocab_size) {
@@ -122,6 +122,16 @@ __global__ static void train_kernel(
             embeddings[target_word * embed_dim + d] - expected;
     }
 
+    /* Contrastive gradients for the target and sampled negative embeddings. */
+    for (int k = 0; k <= NEGATIVE_COUNT; k++) {
+        double coefficient = (k == 0 ? 1.0 : 0.0) - candidate_probs[k];
+        for (int d = 0; d < embed_dim; d++) {
+            atomic_add_double(
+                &grad_embeddings[candidates[k] * embed_dim + d],
+                coefficient * output[target_start + d]);
+        }
+    }
+
     for (int h = 0; h < hidden_size; h++) {
         double value = 0.0;
         for (int o = target_start; o < target_start + embed_dim; o++) {
@@ -132,9 +142,14 @@ __global__ static void train_kernel(
     }
 
     for (int i = 0; i < input_size; i++) {
+        double input_error = 0.0;
         for (int h = 0; h < hidden_size; h++) {
+            input_error += error_h[h] * weights_ih[i * hidden_size + h];
             atomic_add_double(&grad_ih[i * hidden_size + h], error_h[h] * input[i]);
         }
+        int source_word = i < embed_dim ? word_a : word_b;
+        int dimension = i < embed_dim ? i : i - embed_dim;
+        atomic_add_double(&grad_embeddings[source_word * embed_dim + dimension], input_error);
     }
 
     for (int o = target_start; o < target_start + embed_dim; o++) {
@@ -149,8 +164,8 @@ struct DeviceState {
     int device;
     int *word_ids;
     double *embeddings, *weights_ih, *weights_ho, *bias_h, *bias_o;
-    double *grad_ih, *grad_ho, *grad_bias_h, *grad_bias_o, *loss;
-    double *host_grad_ih, *host_grad_ho, *host_grad_bias_h, *host_grad_bias_o;
+    double *grad_ih, *grad_ho, *grad_bias_h, *grad_bias_o, *grad_embeddings, *loss;
+    double *host_grad_ih, *host_grad_ho, *host_grad_bias_h, *host_grad_bias_o, *host_grad_embeddings;
     double host_loss;
 };
 
@@ -176,6 +191,7 @@ static void allocate_state(DeviceState *state, int device,
     cuda_check(cudaMalloc(&state->grad_ho, ho_bytes), "grad_ho");
     cuda_check(cudaMalloc(&state->grad_bias_h, bh_bytes), "grad_bias_h");
     cuda_check(cudaMalloc(&state->grad_bias_o, bo_bytes), "grad_bias_o");
+    cuda_check(cudaMalloc(&state->grad_embeddings, embedding_bytes), "grad_embeddings");
     cuda_check(cudaMalloc(&state->loss, sizeof(double)), "loss");
 
     cuda_check(cudaMemcpy(state->word_ids, word_ids, words_bytes, cudaMemcpyHostToDevice), "copy word_ids");
@@ -185,6 +201,7 @@ static void allocate_state(DeviceState *state, int device,
     state->host_grad_ho = (double *)malloc(ho_bytes);
     state->host_grad_bias_h = (double *)malloc(bh_bytes);
     state->host_grad_bias_o = (double *)malloc(bo_bytes);
+    state->host_grad_embeddings = (double *)malloc(embedding_bytes);
 }
 
 static void free_state(DeviceState *state) {
@@ -194,9 +211,11 @@ static void free_state(DeviceState *state) {
     cudaFree(state->bias_h); cudaFree(state->bias_o);
     cudaFree(state->grad_ih); cudaFree(state->grad_ho);
     cudaFree(state->grad_bias_h); cudaFree(state->grad_bias_o);
+    cudaFree(state->grad_embeddings);
     cudaFree(state->loss);
     free(state->host_grad_ih); free(state->host_grad_ho);
     free(state->host_grad_bias_h); free(state->host_grad_bias_o);
+    free(state->host_grad_embeddings);
 }
 
 extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
@@ -233,6 +252,8 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
     double *sum_ho = (double *)calloc(ho_count, sizeof(double));
     double *sum_bh = (double *)calloc(nn->hidden_size, sizeof(double));
     double *sum_bo = (double *)calloc(nn->output_size, sizeof(double));
+    size_t embedding_count = nn->vocab_size * nn->embed_dim;
+    double *sum_embeddings = (double *)calloc(embedding_count, sizeof(double));
     int sample_count = (int)(triangle_count * 3);
     int block_size = 256;
 
@@ -256,10 +277,12 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
             cuda_check(cudaMemcpy(state->weights_ho, nn->weights_ho, ho_count * sizeof(double), cudaMemcpyHostToDevice), "weights_ho");
             cuda_check(cudaMemcpy(state->bias_h, nn->bias_h, nn->hidden_size * sizeof(double), cudaMemcpyHostToDevice), "bias_h");
             cuda_check(cudaMemcpy(state->bias_o, nn->bias_o, nn->output_size * sizeof(double), cudaMemcpyHostToDevice), "bias_o");
+            cuda_check(cudaMemcpy(state->embeddings, nn->embeddings, embedding_count * sizeof(double), cudaMemcpyHostToDevice), "embeddings");
             cuda_check(cudaMemset(state->grad_ih, 0, ih_count * sizeof(double)), "clear grad_ih");
             cuda_check(cudaMemset(state->grad_ho, 0, ho_count * sizeof(double)), "clear grad_ho");
             cuda_check(cudaMemset(state->grad_bias_h, 0, nn->hidden_size * sizeof(double)), "clear grad_bias_h");
             cuda_check(cudaMemset(state->grad_bias_o, 0, nn->output_size * sizeof(double)), "clear grad_bias_o");
+            cuda_check(cudaMemset(state->grad_embeddings, 0, embedding_count * sizeof(double)), "clear grad_embeddings");
             cuda_check(cudaMemset(state->loss, 0, sizeof(double)), "clear loss");
 
             int blocks = (end - start + block_size - 1) / block_size;
@@ -267,7 +290,7 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
                 state->word_ids, state->embeddings, state->weights_ih,
                 state->weights_ho, state->bias_h, state->bias_o,
                 state->grad_ih, state->grad_ho, state->grad_bias_h,
-                state->grad_bias_o, state->loss, (int)triangle_count,
+                state->grad_bias_o, state->grad_embeddings, state->loss, (int)triangle_count,
                 start, end, nn->embed_dim, nn->input_size,
                 nn->hidden_size, nn->output_size, nn->vocab_size);
             cuda_check(cudaGetLastError(), "train_kernel launch");
@@ -276,12 +299,14 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
             cuda_check(cudaMemcpy(state->host_grad_ho, state->grad_ho, ho_count * sizeof(double), cudaMemcpyDeviceToHost), "copy grad_ho");
             cuda_check(cudaMemcpy(state->host_grad_bias_h, state->grad_bias_h, nn->hidden_size * sizeof(double), cudaMemcpyDeviceToHost), "copy grad_bias_h");
             cuda_check(cudaMemcpy(state->host_grad_bias_o, state->grad_bias_o, nn->output_size * sizeof(double), cudaMemcpyDeviceToHost), "copy grad_bias_o");
+            cuda_check(cudaMemcpy(state->host_grad_embeddings, state->grad_embeddings, embedding_count * sizeof(double), cudaMemcpyDeviceToHost), "copy grad_embeddings");
             cuda_check(cudaMemcpy(&state->host_loss, state->loss, sizeof(double), cudaMemcpyDeviceToHost), "copy loss");
 
             for (size_t i = 0; i < ih_count; i++) sum_ih[i] += state->host_grad_ih[i];
             for (size_t i = 0; i < ho_count; i++) sum_ho[i] += state->host_grad_ho[i];
             for (int i = 0; i < nn->hidden_size; i++) sum_bh[i] += state->host_grad_bias_h[i];
             for (int i = 0; i < nn->output_size; i++) sum_bo[i] += state->host_grad_bias_o[i];
+            for (size_t i = 0; i < embedding_count; i++) sum_embeddings[i] += state->host_grad_embeddings[i];
             total_loss += state->host_loss;
         }
 
@@ -290,6 +315,7 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
         for (size_t i = 0; i < ho_count; i++) nn->weights_ho[i] += scale * sum_ho[i];
         for (int i = 0; i < nn->hidden_size; i++) nn->bias_h[i] += scale * sum_bh[i];
         for (int i = 0; i < nn->output_size; i++) nn->bias_o[i] += scale * sum_bo[i];
+        for (size_t i = 0; i < embedding_count; i++) nn->embeddings[i] += scale * sum_embeddings[i];
 
         trainer->logs[epoch].epoch = epoch;
         trainer->logs[epoch].loss = total_loss / sample_count;
@@ -302,6 +328,6 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
     }
 
     for (int g = 0; g < gpu_count; g++) free_state(&states[g]);
-    free(states); free(word_ids); free(sum_ih); free(sum_ho); free(sum_bh); free(sum_bo);
+    free(states); free(word_ids); free(sum_ih); free(sum_ho); free(sum_bh); free(sum_bo); free(sum_embeddings);
     return 0;
 }
