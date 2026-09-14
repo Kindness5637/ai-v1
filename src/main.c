@@ -48,6 +48,7 @@ void print_usage(void) {
     printf("  ./triangle.out <file> -graph <m>   - Build graph with circle multiplier m\n");
     printf("  ./triangle.out <file> -context-graph - Build rotated context graph\n");
     printf("  ./triangle.out <file> -context-query <a> <b> - Query ordered context\n");
+    printf("  ./triangle.out <file> -predict <a> <b> - Rank graph candidates neurally\n");
     printf("  ./triangle.out <old> -learn <new>  - Learn from new text using old as base\n");
     printf("  ./triangle.out <file> -backprop    - Train with backpropagation\n");
 }
@@ -112,7 +113,8 @@ int main(int argc, char *argv[]) {
                       strcmp(argv[2], "-backprop-cuda") != 0 &&
                       strcmp(argv[2], "-train") != 0 &&
                       strcmp(argv[2], "-context-graph") != 0 &&
-                      strcmp(argv[2], "-context-query") != 0)) {
+                      strcmp(argv[2], "-context-query") != 0 &&
+                      strcmp(argv[2], "-predict") != 0)) {
         print_triangles(chain);
     }
 
@@ -266,6 +268,104 @@ int main(int argc, char *argv[]) {
             }
             context_graph_query(context_graph, chain, first_id, second_id, 20);
             context_graph_free(context_graph);
+        }
+    } else if (argc > 4 && strcmp(argv[2], "-predict") == 0) {
+        int first_id = 0;
+        int second_id = 0;
+        for (size_t i = 0; i < chain->vocab->count; i++) {
+            if (strcmp(chain->vocab->words[i].text, argv[3]) == 0) first_id = (int)i + 1;
+            if (strcmp(chain->vocab->words[i].text, argv[4]) == 0) second_id = (int)i + 1;
+        }
+        if (first_id == 0 || second_id == 0) {
+            fprintf(stderr, "One or both prediction words are not in the vocabulary\n");
+        } else {
+            BackpropTrainer *trainer = backprop_load_model("backprop_model.bin");
+            ContextGraph *context_graph = context_graph_create(chain);
+            if (!trainer || !context_graph) {
+                fprintf(stderr, "Need backprop_model.bin and a context graph\n");
+                backprop_free(trainer);
+                context_graph_free(context_graph);
+                free_triangles(chain);
+                free(file_content);
+                return 1;
+            }
+
+            int candidate_ids[256];
+            size_t candidate_count = 0;
+            for (size_t i = 0; i < context_graph->node_count; i++) {
+                const ContextNode *node = &context_graph->nodes[i];
+                if (node->type != CONTEXT_TRIANGLE_NODE ||
+                    node->word_ids[0] != first_id ||
+                    node->word_ids[1] != second_id) continue;
+
+                int candidates_to_add[2] = {node->word_ids[2], 0};
+                for (size_t b = 0; b < context_graph->bond_count; b++) {
+                    const ContextBond *bond = &context_graph->bonds[b];
+                    if (bond->from_id == node->id && bond->type == BOND_NEIGHBOR) {
+                        candidates_to_add[1] = context_graph->nodes[bond->to_id - 1].word_ids[2];
+                        break;
+                    }
+                }
+                for (int c = 0; c < 2; c++) {
+                    if (candidates_to_add[c] <= 0) continue;
+                    int exists = 0;
+                    for (size_t j = 0; j < candidate_count; j++) {
+                        if (candidate_ids[j] == candidates_to_add[c]) exists = 1;
+                    }
+                    if (!exists && candidate_count < 256) {
+                        candidate_ids[candidate_count++] = candidates_to_add[c];
+                    }
+                }
+            }
+
+            if (candidate_count == 0) {
+                printf("No graph candidates found for [%s, %s].\n", argv[3], argv[4]);
+            } else {
+                int first_index = first_id - 1;
+                int second_index = second_id - 1;
+                int embed_dim = trainer->network->embed_dim;
+                double *input = calloc(2 * embed_dim, sizeof(double));
+                double *output = calloc(trainer->network->output_size, sizeof(double));
+                for (int d = 0; d < embed_dim; d++) {
+                    input[d] = trainer->network->embeddings[first_index * embed_dim + d];
+                    input[embed_dim + d] = trainer->network->embeddings[second_index * embed_dim + d];
+                }
+                backprop_predict(trainer, input, output);
+
+                double candidate_distances[256];
+                for (size_t i = 0; i < candidate_count; i++) {
+                    int candidate_index = candidate_ids[i] - 1;
+                    candidate_distances[i] = 0.0;
+                    for (int d = 0; d < embed_dim; d++) {
+                        double delta = output[2 * embed_dim + d] -
+                            trainer->network->embeddings[candidate_index * embed_dim + d];
+                        candidate_distances[i] += delta * delta;
+                    }
+                }
+                for (size_t i = 1; i < candidate_count; i++) {
+                    int id = candidate_ids[i];
+                    double distance = candidate_distances[i];
+                    size_t j = i;
+                    while (j > 0 && candidate_distances[j - 1] > distance) {
+                        candidate_ids[j] = candidate_ids[j - 1];
+                        candidate_distances[j] = candidate_distances[j - 1];
+                        j--;
+                    }
+                    candidate_ids[j] = id;
+                    candidate_distances[j] = distance;
+                }
+
+                printf("\n=== Neural Ranking for [%s, %s] ===\n", argv[3], argv[4]);
+                for (size_t i = 0; i < candidate_count; i++) {
+                    printf("  candidate=%s (id=%d) distance=%.6f\n",
+                           vocab_get_word(chain->vocab, candidate_ids[i]),
+                           candidate_ids[i], candidate_distances[i]);
+                }
+                free(input);
+                free(output);
+            }
+            context_graph_free(context_graph);
+            backprop_free(trainer);
         }
     } else if (argc > 2 && strcmp(argv[2], "-learn") == 0) {
         if (argc < 4) {
