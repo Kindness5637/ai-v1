@@ -43,5 +43,7 @@ ContextGraph *context_graph_create(const TriangleChain *chain);
 void context_graph_free(ContextGraph *graph);
 void context_graph_print(const ContextGraph *graph);
 void context_graph_save_dot(const ContextGraph *graph, const char *filename);
+void context_graph_query(const ContextGraph *graph, const TriangleChain *chain,
+                         int first_word_id, int second_word_id, size_t limit);
 
 #endif

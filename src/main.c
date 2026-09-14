@@ -47,6 +47,7 @@ void print_usage(void) {
     printf("  ./triangle.out <file> -circle <m>  - Analyze conjunctions with multiplier m\n");
     printf("  ./triangle.out <file> -graph <m>   - Build graph with circle multiplier m\n");
     printf("  ./triangle.out <file> -context-graph - Build rotated context graph\n");
+    printf("  ./triangle.out <file> -context-query <a> <b> - Query ordered context\n");
     printf("  ./triangle.out <old> -learn <new>  - Learn from new text using old as base\n");
     printf("  ./triangle.out <file> -backprop    - Train with backpropagation\n");
 }
@@ -110,7 +111,8 @@ int main(int argc, char *argv[]) {
     if (argc <= 2 || (strcmp(argv[2], "-backprop") != 0 &&
                       strcmp(argv[2], "-backprop-cuda") != 0 &&
                       strcmp(argv[2], "-train") != 0 &&
-                      strcmp(argv[2], "-context-graph") != 0)) {
+                      strcmp(argv[2], "-context-graph") != 0 &&
+                      strcmp(argv[2], "-context-query") != 0)) {
         print_triangles(chain);
     }
 
@@ -245,6 +247,26 @@ int main(int argc, char *argv[]) {
         context_graph_print(context_graph);
         context_graph_save_dot(context_graph, "context_graph.dot");
         context_graph_free(context_graph);
+    } else if (argc > 4 && strcmp(argv[2], "-context-query") == 0) {
+        int first_id = 0;
+        int second_id = 0;
+        for (size_t i = 0; i < chain->vocab->count; i++) {
+            if (strcmp(chain->vocab->words[i].text, argv[3]) == 0) first_id = (int)i + 1;
+            if (strcmp(chain->vocab->words[i].text, argv[4]) == 0) second_id = (int)i + 1;
+        }
+        if (first_id == 0 || second_id == 0) {
+            fprintf(stderr, "One or both query words are not in the vocabulary\n");
+        } else {
+            ContextGraph *context_graph = context_graph_create(chain);
+            if (!context_graph) {
+                fprintf(stderr, "Failed to create context graph\n");
+                free_triangles(chain);
+                free(file_content);
+                return 1;
+            }
+            context_graph_query(context_graph, chain, first_id, second_id, 20);
+            context_graph_free(context_graph);
+        }
     } else if (argc > 2 && strcmp(argv[2], "-learn") == 0) {
         if (argc < 4) {
             fprintf(stderr, "Error: -learn requires new text/file argument\n");

@@ -159,3 +159,47 @@ void context_graph_save_dot(const ContextGraph *graph, const char *filename) {
     fclose(file);
     printf("Saved context graph to %s\n", filename);
 }
+
+void context_graph_query(const ContextGraph *graph, const TriangleChain *chain,
+                         int first_word_id, int second_word_id, size_t limit) {
+    if (!graph || !chain || limit == 0) return;
+
+    size_t matches = 0;
+    printf("\n=== Context Query: [%d, %d] ===\n", first_word_id, second_word_id);
+    for (size_t i = 0; i < graph->node_count && matches < limit; i++) {
+        const ContextNode *node = &graph->nodes[i];
+        if (node->type != CONTEXT_TRIANGLE_NODE ||
+            node->word_ids[0] != first_word_id ||
+            node->word_ids[1] != second_word_id) {
+            continue;
+        }
+
+        int next_id = node->word_ids[2];
+        const char *first = vocab_get_word(chain->vocab, node->word_ids[0]);
+        const char *second = vocab_get_word(chain->vocab, node->word_ids[1]);
+        const char *next = vocab_get_word(chain->vocab, next_id);
+        printf("Match %zu: triangle=%d rotation=%d [%s, %s] -> %s "
+               "signature=%016llx\n",
+               matches + 1, node->triangle_id, node->rotation,
+               first ? first : "?", second ? second : "?",
+               next ? next : "?", (unsigned long long)node->signature);
+
+        for (size_t b = 0; b < graph->bond_count; b++) {
+            const ContextBond *bond = &graph->bonds[b];
+            if (bond->from_id != node->id || bond->type != BOND_NEIGHBOR) continue;
+            const ContextNode *neighbor = &graph->nodes[bond->to_id - 1];
+            const char *neighbor_next = vocab_get_word(chain->vocab,
+                                                       neighbor->word_ids[2]);
+            printf("  Neighbor: triangle=%d rotation=%d -> %s weight=%.1f\n",
+                   neighbor->triangle_id, neighbor->rotation,
+                   neighbor_next ? neighbor_next : "?", bond->weight);
+        }
+        matches++;
+    }
+
+    if (matches == 0) {
+        printf("No exact ordered context found.\n");
+    } else {
+        printf("Found %zu matching context(s).\n", matches);
+    }
+}
