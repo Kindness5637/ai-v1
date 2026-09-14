@@ -5,7 +5,7 @@ SRC = src/main.c src/core/triangle.c src/core/word.c src/core/geometry.c src/cor
 OUT = triangle.out
 
 CUDA = nvcc
-CUDA_FLAGS = -O3 -Iinclude -Xcompiler -fopenmp
+CUDA_FLAGS = -O3 -arch=sm_75 -Iinclude -Xcompiler -fopenmp
 CUDA_SRC = src/main.c src/core/triangle.c src/core/word.c src/core/geometry.c src/core/probability.c src/core/matcher.c src/core/neural.c src/core/formula.c src/core/matrix.c src/core/reconstruct.c src/core/circle.c src/core/graph.c src/core/learn.c src/core/punctuation.c src/core/backprop.c
 CUDA_C = $(CUDA_SRC:.c=.cuda.o)
 CUDA_O = src/core/backprop_cuda.cuda.o

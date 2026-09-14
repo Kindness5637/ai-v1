@@ -11,6 +11,21 @@ static inline void cuda_check(cudaError_t status, const char *what) {
     }
 }
 
+__device__ static inline void atomic_add_double(double *address, double value) {
+#if __CUDA_ARCH__ >= 600
+    atomicAdd(address, value);
+#else
+    unsigned long long *as_ull = (unsigned long long *)address;
+    unsigned long long old = *as_ull;
+    unsigned long long assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(as_ull, assumed,
+                        __double_as_longlong(value + __longlong_as_double(assumed)));
+    } while (assumed != old);
+#endif
+}
+
 __device__ static double device_sigmoid(double x) {
     return 1.0 / (1.0 + exp(-x));
 }
@@ -69,7 +84,7 @@ __global__ static void train_kernel(
         int o = target_start + d;
         double error = embeddings[target_word * embed_dim + d] - output[o];
         error_o[o] = error;
-        atomicAdd(loss, error * error);
+        atomic_add_double(loss, error * error);
     }
 
     for (int h = 0; h < hidden_size; h++) {
@@ -78,19 +93,19 @@ __global__ static void train_kernel(
             value += error_o[o] * weights_ho[h * output_size + o];
         }
         error_h[h] = value * hidden[h] * (1.0 - hidden[h]);
-        atomicAdd(&grad_bias_h[h], error_h[h]);
+        atomic_add_double(&grad_bias_h[h], error_h[h]);
     }
 
     for (int i = 0; i < input_size; i++) {
         for (int h = 0; h < hidden_size; h++) {
-            atomicAdd(&grad_ih[i * hidden_size + h], error_h[h] * input[i]);
+            atomic_add_double(&grad_ih[i * hidden_size + h], error_h[h] * input[i]);
         }
     }
 
     for (int o = target_start; o < target_start + embed_dim; o++) {
-        atomicAdd(&grad_bias_o[o], error_o[o]);
+        atomic_add_double(&grad_bias_o[o], error_o[o]);
         for (int h = 0; h < hidden_size; h++) {
-            atomicAdd(&grad_ho[h * output_size + o], error_o[o] * hidden[h]);
+            atomic_add_double(&grad_ho[h * output_size + o], error_o[o] * hidden[h]);
         }
     }
 }
