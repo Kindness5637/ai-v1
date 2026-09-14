@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cmath>
 
+#define NEGATIVE_COUNT 32
+
 static inline void cuda_check(cudaError_t status, const char *what) {
     if (status != cudaSuccess) {
         fprintf(stderr, "CUDA error in %s: %s\n", what, cudaGetErrorString(status));
@@ -37,7 +39,8 @@ __global__ static void train_kernel(
     double *grad_ih, double *grad_ho, double *grad_bias_h,
     double *grad_bias_o, double *loss,
     int triangle_count, int sample_start, int sample_end,
-    int embed_dim, int input_size, int hidden_size, int output_size) {
+    int embed_dim, int input_size, int hidden_size, int output_size,
+    int vocab_size) {
     int sample = sample_start + blockIdx.x * blockDim.x + threadIdx.x;
     if (sample >= sample_end) return;
 
@@ -51,6 +54,9 @@ __global__ static void train_kernel(
     double output[512];
     double error_o[512];
     double error_h[256];
+    int candidates[NEGATIVE_COUNT + 1];
+    double candidate_scores[NEGATIVE_COUNT + 1];
+    double candidate_probs[NEGATIVE_COUNT + 1];
 
     if (input_size > 128 || hidden_size > 256 || output_size > 512) return;
 
@@ -80,11 +86,40 @@ __global__ static void train_kernel(
 
     int target_word = word_ids[triangle * 3 + target_position];
     int target_start = target_position * embed_dim;
+    candidates[0] = target_word;
+    for (int k = 0; k < NEGATIVE_COUNT; k++) {
+        unsigned long long seed = (unsigned long long)(sample + 1) * 2862933555777941757ULL;
+        seed += (unsigned long long)(k + 1) * 3037000493ULL;
+        int candidate = (int)(seed % (unsigned long long)vocab_size);
+        if (candidate == target_word) candidate = (candidate + 1) % vocab_size;
+        candidates[k + 1] = candidate;
+    }
+
+    double max_score = -1.0e300;
+    for (int k = 0; k <= NEGATIVE_COUNT; k++) {
+        double score = 0.0;
+        for (int d = 0; d < embed_dim; d++) {
+            score += output[target_start + d] * embeddings[candidates[k] * embed_dim + d];
+        }
+        candidate_scores[k] = score;
+        if (score > max_score) max_score = score;
+    }
+
+    double denominator = 0.0;
+    for (int k = 0; k <= NEGATIVE_COUNT; k++) {
+        candidate_probs[k] = exp(candidate_scores[k] - max_score);
+        denominator += candidate_probs[k];
+    }
+    for (int k = 0; k <= NEGATIVE_COUNT; k++) candidate_probs[k] /= denominator;
+    atomic_add_double(loss, -log(candidate_probs[0]));
+
     for (int d = 0; d < embed_dim; d++) {
-        int o = target_start + d;
-        double error = embeddings[target_word * embed_dim + d] - output[o];
-        error_o[o] = error;
-        atomic_add_double(loss, error * error);
+        double expected = 0.0;
+        for (int k = 0; k <= NEGATIVE_COUNT; k++) {
+            expected += candidate_probs[k] * embeddings[candidates[k] * embed_dim + d];
+        }
+        error_o[target_start + d] =
+            embeddings[target_word * embed_dim + d] - expected;
     }
 
     for (int h = 0; h < hidden_size; h++) {
@@ -201,8 +236,8 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
     int sample_count = (int)(triangle_count * 3);
     int block_size = 256;
 
-    printf("CUDA training: %d GPU(s), %d rotation samples, block size %d\n",
-           gpu_count, sample_count, block_size);
+    printf("CUDA sampled-contrastive training: %d GPU(s), %d rotation samples, %d negatives, block size %d\n",
+           gpu_count, sample_count, NEGATIVE_COUNT, block_size);
     fflush(stdout);
 
     for (int epoch = 0; epoch < trainer->max_epochs; epoch++) {
@@ -234,7 +269,7 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
                 state->grad_ih, state->grad_ho, state->grad_bias_h,
                 state->grad_bias_o, state->loss, (int)triangle_count,
                 start, end, nn->embed_dim, nn->input_size,
-                nn->hidden_size, nn->output_size);
+                nn->hidden_size, nn->output_size, nn->vocab_size);
             cuda_check(cudaGetLastError(), "train_kernel launch");
             cuda_check(cudaDeviceSynchronize(), "train_kernel synchronize");
             cuda_check(cudaMemcpy(state->host_grad_ih, state->grad_ih, ih_count * sizeof(double), cudaMemcpyDeviceToHost), "copy grad_ih");
@@ -257,7 +292,7 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
         for (int i = 0; i < nn->output_size; i++) nn->bias_o[i] += scale * sum_bo[i];
 
         trainer->logs[epoch].epoch = epoch;
-        trainer->logs[epoch].loss = total_loss / (sample_count * nn->embed_dim);
+        trainer->logs[epoch].loss = total_loss / sample_count;
         trainer->logs[epoch].accuracy = 0.0;
         trainer->log_count++;
         if (epoch % 5 == 0 || epoch == trainer->max_epochs - 1) {
