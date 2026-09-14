@@ -9,6 +9,7 @@ training_output.txt
 first_pass_results.txt
 matrix.csv
 graph.dot
+context_graph.dot
 
 # Local/editor files
 .DS_Store

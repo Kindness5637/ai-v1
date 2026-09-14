@@ -10,6 +10,7 @@
 #include "core/reconstruct.h"
 #include "core/circle.h"
 #include "core/graph.h"
+#include "core/context_graph.h"
 #include "core/learn.h"
 #include "core/punctuation.h"
 #include "core/backprop.h"
@@ -45,6 +46,7 @@ void print_usage(void) {
     printf("  ./triangle.out <file> -reconstruct - Reconstruct text from IDs\n");
     printf("  ./triangle.out <file> -circle <m>  - Analyze conjunctions with multiplier m\n");
     printf("  ./triangle.out <file> -graph <m>   - Build graph with circle multiplier m\n");
+    printf("  ./triangle.out <file> -context-graph - Build rotated context graph\n");
     printf("  ./triangle.out <old> -learn <new>  - Learn from new text using old as base\n");
     printf("  ./triangle.out <file> -backprop    - Train with backpropagation\n");
 }
@@ -105,7 +107,10 @@ int main(int argc, char *argv[]) {
 
     printf("Created %zu triangle(s)\n", chain->count);
     printf("Vocabulary size: %zu\n", chain->vocab->count);
-    if (argc <= 2 || (strcmp(argv[2], "-backprop") != 0 && strcmp(argv[2], "-train") != 0)) {
+    if (argc <= 2 || (strcmp(argv[2], "-backprop") != 0 &&
+                      strcmp(argv[2], "-backprop-cuda") != 0 &&
+                      strcmp(argv[2], "-train") != 0 &&
+                      strcmp(argv[2], "-context-graph") != 0)) {
         print_triangles(chain);
     }
 
@@ -229,7 +234,17 @@ int main(int argc, char *argv[]) {
             graph_save_dot(graph, "graph.dot");
             graph_free(graph);
         }
-        if (circles) circle_free(circles);
+    } else if (argc > 2 && strcmp(argv[2], "-context-graph") == 0) {
+        ContextGraph *context_graph = context_graph_create(chain);
+        if (!context_graph) {
+            fprintf(stderr, "Failed to create context graph\n");
+            free_triangles(chain);
+            free(file_content);
+            return 1;
+        }
+        context_graph_print(context_graph);
+        context_graph_save_dot(context_graph, "context_graph.dot");
+        context_graph_free(context_graph);
     } else if (argc > 2 && strcmp(argv[2], "-learn") == 0) {
         if (argc < 4) {
             fprintf(stderr, "Error: -learn requires new text/file argument\n");

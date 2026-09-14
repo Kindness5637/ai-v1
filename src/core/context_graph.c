@@ -1,0 +1,161 @@
+#include "context_graph.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+static uint64_t signature_for(const int words[3], int rotation) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (int i = 0; i < 3; i++) {
+        hash ^= (uint64_t)(unsigned int)words[(rotation + i) % 3];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static int add_bond(ContextGraph *graph, int from, int to, double weight,
+                    ContextBondType type) {
+    ContextBond *grown = realloc(graph->bonds,
+                                 (graph->bond_count + 1) * sizeof(ContextBond));
+    if (!grown) return 0;
+    graph->bonds = grown;
+    graph->bonds[graph->bond_count++] = (ContextBond){from, to, weight, type};
+    return 1;
+}
+
+ContextGraph *context_graph_create(const TriangleChain *chain) {
+    if (!chain || !chain->vocab) return NULL;
+
+    ContextGraph *graph = calloc(1, sizeof(ContextGraph));
+    if (!graph) return NULL;
+
+    size_t context_count = chain->count * 3;
+    graph->node_count = context_count + chain->vocab->count;
+    graph->nodes = calloc(graph->node_count, sizeof(ContextNode));
+    if (!graph->nodes) {
+        free(graph);
+        return NULL;
+    }
+
+    for (size_t t = 0; t < chain->count; t++) {
+        const Triangle *triangle = &chain->triangles[t];
+        for (int rotation = 0; rotation < 3; rotation++) {
+            size_t index = t * 3 + rotation;
+            ContextNode *node = &graph->nodes[index];
+            node->id = (int)index + 1;
+            node->type = CONTEXT_TRIANGLE_NODE;
+            node->triangle_id = triangle->id;
+            node->rotation = rotation;
+            for (int i = 0; i < 3; i++) {
+                node->word_ids[i] = triangle->word_ids[(rotation + i) % 3];
+            }
+            node->signature = signature_for(triangle->word_ids, rotation);
+
+            int word_node_base = (int)context_count;
+            for (int i = 0; i < 3; i++) {
+                int word_id = node->word_ids[i];
+                if (word_id <= 0 || word_id > (int)chain->vocab->count) continue;
+                if (!add_bond(graph, node->id, word_node_base + word_id,
+                              1.0, BOND_OCCURRENCE)) {
+                    context_graph_free(graph);
+                    return NULL;
+                }
+            }
+
+            int next_rotation = (rotation + 1) % 3;
+            if (!add_bond(graph, node->id, (int)(t * 3 + next_rotation) + 1,
+                          2.0, BOND_ROTATION)) {
+                context_graph_free(graph);
+                return NULL;
+            }
+
+            if (t + 1 < chain->count) {
+                int next_id = (int)((t + 1) * 3 + rotation) + 1;
+                if (!add_bond(graph, node->id, next_id, 1.5, BOND_NEIGHBOR)) {
+                    context_graph_free(graph);
+                    return NULL;
+                }
+            }
+        }
+    }
+
+    for (size_t i = 0; i < chain->vocab->count; i++) {
+        ContextNode *node = &graph->nodes[context_count + i];
+        node->id = (int)context_count + (int)i + 1;
+        node->type = CONTEXT_WORD_NODE;
+        node->word_id = (int)i + 1;
+    }
+
+    return graph;
+}
+
+void context_graph_free(ContextGraph *graph) {
+    if (!graph) return;
+    free(graph->nodes);
+    free(graph->bonds);
+    free(graph);
+}
+
+static const char *bond_name(ContextBondType type) {
+    switch (type) {
+        case BOND_OCCURRENCE: return "occurrence";
+        case BOND_ROTATION: return "rotation";
+        case BOND_NEIGHBOR: return "neighbor";
+        default: return "bond";
+    }
+}
+
+void context_graph_print(const ContextGraph *graph) {
+    if (!graph) return;
+    size_t triangles = 0, words = 0;
+    for (size_t i = 0; i < graph->node_count; i++) {
+        if (graph->nodes[i].type == CONTEXT_TRIANGLE_NODE) triangles++;
+        else words++;
+    }
+    printf("\n=== Context Graph ===\n");
+    printf("Context nodes: %zu\nWord hubs: %zu\nBonds: %zu\n",
+           triangles, words, graph->bond_count);
+    printf("Sample context nodes:\n");
+    size_t shown = 0;
+    for (size_t i = 0; i < graph->node_count && shown < 10; i++) {
+        const ContextNode *node = &graph->nodes[i];
+        if (node->type != CONTEXT_TRIANGLE_NODE) continue;
+        printf("  C%d triangle=%d rotation=%d [%d,%d,%d] signature=%016llx\n",
+               node->id, node->triangle_id, node->rotation,
+               node->word_ids[0], node->word_ids[1], node->word_ids[2],
+               (unsigned long long)node->signature);
+        shown++;
+    }
+    printf("Sample bonds:\n");
+    shown = 0;
+    for (size_t i = 0; i < graph->bond_count && shown < 20; i++) {
+        const ContextBond *bond = &graph->bonds[i];
+        printf("  %d -> %d type=%s weight=%.1f\n",
+               bond->from_id, bond->to_id, bond_name(bond->type), bond->weight);
+        shown++;
+    }
+}
+
+void context_graph_save_dot(const ContextGraph *graph, const char *filename) {
+    if (!graph || !filename) return;
+    FILE *file = fopen(filename, "w");
+    if (!file) return;
+    fprintf(file, "digraph ContextGraph {\n  rankdir=LR;\n");
+    for (size_t i = 0; i < graph->node_count; i++) {
+        const ContextNode *node = &graph->nodes[i];
+        if (node->type == CONTEXT_TRIANGLE_NODE) {
+            fprintf(file, "  n%d [shape=box,label=\"T%d r%d\\n%d %d %d\"];\n",
+                    node->id, node->triangle_id, node->rotation,
+                    node->word_ids[0], node->word_ids[1], node->word_ids[2]);
+        } else {
+            fprintf(file, "  n%d [shape=circle,label=\"W%d\"];\n",
+                    node->id, node->word_id);
+        }
+    }
+    for (size_t i = 0; i < graph->bond_count; i++) {
+        const ContextBond *bond = &graph->bonds[i];
+        fprintf(file, "  n%d -> n%d [label=\"%s %.1f\"];\n",
+                bond->from_id, bond->to_id, bond_name(bond->type), bond->weight);
+    }
+    fprintf(file, "}\n");
+    fclose(file);
+    printf("Saved context graph to %s\n", filename);
+}
