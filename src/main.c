@@ -318,7 +318,7 @@ int main(int argc, char *argv[]) {
                         candidate_ids[candidate_count++] = candidates_to_add[c];
                     }
                 }
-            }
+            } 
 
             if (candidate_count == 0) {
                 printf("No graph candidates found for [%s, %s].\n", argv[3], argv[4]);
@@ -335,6 +335,9 @@ int main(int argc, char *argv[]) {
                 backprop_predict(trainer, input, output);
 
                 double candidate_distances[256];
+                ContextCandidate evidence[256];
+                size_t evidence_count = context_graph_collect_candidate_evidence(
+                    context_graph, first_id, second_id, evidence, 256);
                 for (size_t i = 0; i < candidate_count; i++) {
                     int candidate_index = candidate_ids[i] - 1;
                     candidate_distances[i] = 0.0;
@@ -344,17 +347,34 @@ int main(int argc, char *argv[]) {
                         candidate_distances[i] += delta * delta;
                     }
                 }
+                double candidate_scores[256];
+                for (size_t i = 0; i < candidate_count; i++) {
+                    int occurrence = 0;
+                    int neighbors = 0;
+                    for (size_t e = 0; e < evidence_count; e++) {
+                        if (evidence[e].word_id == candidate_ids[i]) {
+                            occurrence = evidence[e].occurrence_count;
+                            neighbors = evidence[e].neighbor_count;
+                            break;
+                        }
+                    }
+                    candidate_scores[i] = -candidate_distances[i] +
+                        0.75 * log(1.0 + occurrence) + 0.50 * neighbors;
+                }
                 for (size_t i = 1; i < candidate_count; i++) {
                     int id = candidate_ids[i];
                     double distance = candidate_distances[i];
+                    double score = candidate_scores[i];
                     size_t j = i;
-                    while (j > 0 && candidate_distances[j - 1] > distance) {
+                    while (j > 0 && candidate_scores[j - 1] < score) {
                         candidate_ids[j] = candidate_ids[j - 1];
                         candidate_distances[j] = candidate_distances[j - 1];
+                        candidate_scores[j] = candidate_scores[j - 1];
                         j--;
                     }
                     candidate_ids[j] = id;
                     candidate_distances[j] = distance;
+                    candidate_scores[j] = score;
                 }
 
                 printf("\n=== Neural Ranking for [%s, %s] ===\n", argv[3], argv[4]);
@@ -364,9 +384,20 @@ int main(int argc, char *argv[]) {
                 for (size_t i = 0; i < shown; i++) {
                     const char *candidate_word = vocab_get_word(
                         chain->vocab, candidate_ids[i]);
-                    printf("  candidate=%s (id=%d) distance=%.6f\n",
+                    int occurrence = 0;
+                    int neighbors = 0;
+                    for (size_t e = 0; e < evidence_count; e++) {
+                        if (evidence[e].word_id == candidate_ids[i]) {
+                            occurrence = evidence[e].occurrence_count;
+                            neighbors = evidence[e].neighbor_count;
+                            break;
+                        }
+                    }
+                    printf("  candidate=%s (id=%d) score=%.6f distance=%.6f "
+                           "occurrences=%d neighbors=%d\n",
                            candidate_word ? candidate_word : "<unknown>",
-                           candidate_ids[i], candidate_distances[i]);
+                           candidate_ids[i], candidate_scores[i],
+                           candidate_distances[i], occurrence, neighbors);
                 }
                 free(input);
                 free(output);
@@ -407,8 +438,11 @@ int main(int argc, char *argv[]) {
                         context_graph, first_id, second_id, candidate_ids, 256);
                     if (candidate_count == 0) continue;
                     total++;
-                    int target_rank = 0;
-                    double target_distance = 0.0;
+                    ContextCandidate evidence[256];
+                    size_t evidence_count = context_graph_collect_candidate_evidence(
+                        context_graph, first_id, second_id, evidence, 256);
+                    double candidate_scores[256];
+                    double target_score = -INFINITY;
                     for (int d = 0; d < embed_dim; d++) {
                         input[d] = trainer->network->embeddings[(first_id - 1) * embed_dim + d];
                         input[embed_dim + d] = trainer->network->embeddings[(second_id - 1) * embed_dim + d];
@@ -421,20 +455,28 @@ int main(int argc, char *argv[]) {
                                 trainer->network->embeddings[(candidate_ids[c] - 1) * embed_dim + d];
                             distance += delta * delta;
                         }
-                        if (candidate_ids[c] == target_id) target_distance = distance;
-                    }
-                    for (size_t c = 0; c < candidate_count; c++) {
-                        double distance = 0.0;
-                        for (int d = 0; d < embed_dim; d++) {
-                            double delta = output[2 * embed_dim + d] -
-                                trainer->network->embeddings[(candidate_ids[c] - 1) * embed_dim + d];
-                            distance += delta * delta;
+                        int occurrence = 0;
+                        int neighbors = 0;
+                        for (size_t e = 0; e < evidence_count; e++) {
+                            if (evidence[e].word_id == candidate_ids[c]) {
+                                occurrence = evidence[e].occurrence_count;
+                                neighbors = evidence[e].neighbor_count;
+                                break;
+                            }
                         }
-                        if (distance < target_distance) target_rank++;
+                        candidate_scores[c] = -distance +
+                            0.75 * log(1.0 + occurrence) + 0.50 * neighbors;
+                        if (candidate_ids[c] == target_id) target_score = candidate_scores[c];
                     }
                     int found = 0;
                     for (size_t c = 0; c < candidate_count; c++) {
                         if (candidate_ids[c] == target_id) found = 1;
+                    }
+                    int target_rank = 0;
+                    if (found) {
+                        for (size_t c = 0; c < candidate_count; c++) {
+                            if (candidate_scores[c] > target_score) target_rank++;
+                        }
                     }
                     graph_hits += found;
                     neural_top1 += found && target_rank == 0;

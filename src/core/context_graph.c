@@ -233,3 +233,35 @@ size_t context_graph_collect_candidates(const ContextGraph *graph,
     }
     return count;
 }
+
+size_t context_graph_collect_candidate_evidence(const ContextGraph *graph,
+                                                int first_word_id, int second_word_id,
+                                                ContextCandidate *candidates,
+                                                size_t max_candidates) {
+    if (!graph || !candidates || max_candidates == 0) return 0;
+    size_t count = 0;
+    for (size_t i = 0; i < graph->node_count; i++) {
+        const ContextNode *node = &graph->nodes[i];
+        if (node->type != CONTEXT_TRIANGLE_NODE ||
+            node->word_ids[0] != first_word_id ||
+            node->word_ids[1] != second_word_id) continue;
+
+        int next_ids[2] = {node->word_ids[2], 0};
+        if (node->id + 3 <= (int)graph->node_count &&
+            graph->nodes[node->id + 2].type == CONTEXT_TRIANGLE_NODE) {
+            next_ids[1] = graph->nodes[node->id + 2].word_ids[2];
+        }
+        for (int kind = 0; kind < 2; kind++) {
+            if (next_ids[kind] <= 0) continue;
+            size_t index = 0;
+            while (index < count && candidates[index].word_id != next_ids[kind]) index++;
+            if (index == count) {
+                if (count >= max_candidates) continue;
+                candidates[count++] = (ContextCandidate){next_ids[kind], 0, 0};
+            }
+            if (kind == 0) candidates[index].occurrence_count++;
+            else candidates[index].neighbor_count++;
+        }
+    }
+    return count;
+}

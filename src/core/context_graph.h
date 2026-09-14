@@ -39,6 +39,12 @@ typedef struct {
     size_t bond_count;
 } ContextGraph;
 
+typedef struct {
+    int word_id;
+    int occurrence_count;
+    int neighbor_count;
+} ContextCandidate;
+
 ContextGraph *context_graph_create(const TriangleChain *chain);
 void context_graph_free(ContextGraph *graph);
 void context_graph_print(const ContextGraph *graph);
@@ -48,5 +54,9 @@ void context_graph_query(const ContextGraph *graph, const TriangleChain *chain,
 size_t context_graph_collect_candidates(const ContextGraph *graph,
                                         int first_word_id, int second_word_id,
                                         int *candidate_ids, size_t max_candidates);
+size_t context_graph_collect_candidate_evidence(const ContextGraph *graph,
+                                                int first_word_id, int second_word_id,
+                                                ContextCandidate *candidates,
+                                                size_t max_candidates);
 
 #endif
