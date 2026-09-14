@@ -169,6 +169,21 @@ struct DeviceState {
     double host_loss;
 };
 
+static void normalize_embeddings(BackpropNetwork *network) {
+    for (int word = 0; word < network->vocab_size; word++) {
+        double norm = 0.0;
+        for (int d = 0; d < network->embed_dim; d++) {
+            double value = network->embeddings[word * network->embed_dim + d];
+            norm += value * value;
+        }
+        norm = sqrt(norm);
+        if (norm < 1.0e-12) continue;
+        for (int d = 0; d < network->embed_dim; d++) {
+            network->embeddings[word * network->embed_dim + d] /= norm;
+        }
+    }
+}
+
 static void allocate_state(DeviceState *state, int device,
                            const TriangleChain *chain, const BackpropNetwork *nn,
                            const int *word_ids) {
@@ -316,6 +331,7 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
         for (int i = 0; i < nn->hidden_size; i++) nn->bias_h[i] += scale * sum_bh[i];
         for (int i = 0; i < nn->output_size; i++) nn->bias_o[i] += scale * sum_bo[i];
         for (size_t i = 0; i < embedding_count; i++) nn->embeddings[i] += scale * sum_embeddings[i];
+        normalize_embeddings(nn);
 
         trainer->logs[epoch].epoch = epoch;
         trainer->logs[epoch].loss = total_loss / sample_count;
