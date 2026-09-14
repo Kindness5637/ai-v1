@@ -1,0 +1,14 @@
+# Build artifacts
+triangle.out
+*.o
+
+# Generated models and analysis output
+*.bin
+training_output.txt
+first_pass_results.txt
+matrix.csv
+graph.dot
+
+# Local/editor files
+.DS_Store
+*.swp
