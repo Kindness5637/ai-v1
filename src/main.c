@@ -83,7 +83,8 @@ static void evaluate_context_model(BackpropTrainer *trainer,
     }
     if (limit > chain->count) limit = chain->count;
     int graph_hits = 0, neural_top1 = 0, neural_top5 = 0, total = 0;
-    int pair_queries = 0;
+    int pair_queries = 0, ambiguous_pairs = 0, max_candidates = 0;
+    size_t candidate_total = 0;
     int candidate_ids[256];
     int embed_dim = trainer->network->embed_dim;
     double *input = calloc(2 * embed_dim, sizeof(double));
@@ -99,6 +100,9 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             total++;
             if (count == 0) continue;
             pair_queries++;
+            candidate_total += count;
+            if (count > 1) ambiguous_pairs++;
+            if ((int)count > max_candidates) max_candidates = (int)count;
             ContextCandidate evidence[256];
             size_t evidence_count = context_graph_collect_candidate_evidence(
                 graph, first_id, second_id, evidence, 256);
@@ -150,6 +154,11 @@ static void evaluate_context_model(BackpropTrainer *trainer,
         printf("Pair coverage: %.1f%% (%d/%d)\n",
                100.0 * pair_queries / total, pair_queries, total);
         if (pair_queries > 0) {
+            printf("Average candidates per known pair: %.2f\n",
+                   (double)candidate_total / pair_queries);
+            printf("Ambiguous pairs: %.1f%% (%d/%d), max candidates: %d\n",
+                   100.0 * ambiguous_pairs / pair_queries,
+                   ambiguous_pairs, pair_queries, max_candidates);
             printf("Conditional graph recall: %.1f%%\n",
                    100.0 * graph_hits / pair_queries);
             printf("Conditional neural top-1: %.1f%%\n",
