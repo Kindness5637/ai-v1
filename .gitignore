@@ -1,6 +1,7 @@
 # Build artifacts
 triangle.out
 *.o
+*.cuda.o
 
 # Generated models and analysis output
 *.bin

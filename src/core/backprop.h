@@ -33,6 +33,7 @@ typedef struct {
 BackpropTrainer *backprop_create(int vocab_size, int embed_dim, int hidden_size, int output_size, int max_epochs, double lr);
 void backprop_free(BackpropTrainer *trainer);
 void backprop_train(BackpropTrainer *trainer, const TriangleChain *chain);
+int backprop_train_cuda(BackpropTrainer *trainer, const TriangleChain *chain, int requested_gpus);
 int backprop_predict(BackpropTrainer *trainer, double *input, double *output);
 void backprop_print_logs(const BackpropTrainer *trainer);
 void backprop_save_model(const BackpropTrainer *trainer, const char *filename);

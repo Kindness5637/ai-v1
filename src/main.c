@@ -308,8 +308,12 @@ int main(int argc, char *argv[]) {
 
         free(new_content);
         free_triangles(new_chain);
-    } else if (argc > 2 && strcmp(argv[2], "-backprop") == 0) {
-        printf("Starting backpropagation training on full vocabulary...\n\n");
+    } else if (argc > 2 &&
+               (strcmp(argv[2], "-backprop") == 0 ||
+                strcmp(argv[2], "-backprop-cuda") == 0)) {
+        int use_cuda = strcmp(argv[2], "-backprop-cuda") == 0;
+        printf("Starting %s backpropagation training on full vocabulary...\n\n",
+               use_cuda ? "CUDA" : "CPU");
 
         int vocab_size = (int)chain->vocab->count;
         int embed_dim = 32;
@@ -322,7 +326,16 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        backprop_train(trainer, chain);
+        if (use_cuda) {
+            if (backprop_train_cuda(trainer, chain, 2) != 0) {
+                backprop_free(trainer);
+                free_triangles(chain);
+                free(file_content);
+                return 1;
+            }
+        } else {
+            backprop_train(trainer, chain);
+        }
         backprop_save_model(trainer, "backprop_model.bin");
 
         printf("\n=== Final Results ===\n");
