@@ -10,6 +10,7 @@ first_pass_results.txt
 matrix.csv
 graph.dot
 context_graph.dot
+data/cleaned/
 
 # Local/editor files
 .DS_Store

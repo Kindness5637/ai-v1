@@ -75,8 +75,8 @@ static int nearest_word_id(const BackpropNetwork *network, const double *vector)
 }
 
 static void evaluate_context_model(BackpropTrainer *trainer,
-                                   const TriangleChain *chain, size_t limit) {
-    ContextGraph *graph = context_graph_create(chain);
+                                   const TriangleChain *chain,
+                                   const ContextGraph *graph, size_t limit) {
     if (!graph) {
         printf("Unable to create evaluation context graph.\n");
         return;
@@ -95,6 +95,7 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
             size_t count = context_graph_collect_candidates(
                 graph, first_id, second_id, candidate_ids, 256);
+            total++;
             if (count == 0) continue;
             ContextCandidate evidence[256];
             size_t evidence_count = context_graph_collect_candidate_evidence(
@@ -136,7 +137,6 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                 neural_top1 += rank == 0;
                 neural_top5 += rank < 5;
             }
-            total++;
         }
     }
     printf("\n=== Context Evaluation (%zu triangles) ===\n", limit);
@@ -148,7 +148,6 @@ static void evaluate_context_model(BackpropTrainer *trainer,
     }
     free(input);
     free(output);
-    context_graph_free(graph);
 }
 
 int main(int argc, char *argv[]) {
@@ -610,7 +609,9 @@ int main(int argc, char *argv[]) {
                     backprop_free(trainer);
                 } else {
                     backprop_save_model(trainer, "backprop_model_heldout.bin");
-                    evaluate_context_model(trainer, test_chain, 100);
+            ContextGraph *train_graph = context_graph_create(train_chain);
+            evaluate_context_model(trainer, test_chain, train_graph, 100);
+            context_graph_free(train_graph);
                     backprop_free(trainer);
                 }
                 free_triangles(train_chain);
