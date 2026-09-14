@@ -356,9 +356,14 @@ int main(int argc, char *argv[]) {
                 }
 
                 printf("\n=== Neural Ranking for [%s, %s] ===\n", argv[3], argv[4]);
-                for (size_t i = 0; i < candidate_count; i++) {
+                size_t shown = candidate_count < 10 ? candidate_count : 10;
+                printf("Graph candidates: %zu (showing top %zu)\n",
+                       candidate_count, shown);
+                for (size_t i = 0; i < shown; i++) {
+                    const char *candidate_word = vocab_get_word(
+                        chain->vocab, candidate_ids[i]);
                     printf("  candidate=%s (id=%d) distance=%.6f\n",
-                           vocab_get_word(chain->vocab, candidate_ids[i]),
+                           candidate_word ? candidate_word : "<unknown>",
                            candidate_ids[i], candidate_distances[i]);
                 }
                 free(input);
