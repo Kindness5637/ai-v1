@@ -405,6 +405,135 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                 printf("  ├─ Transition Supported (Transition > 0), Weak Positional Ratio: %d\n", trans_ok_pos_weak);
                 printf("  └─ No Relational Support (Neither Position nor Transition): %d\n", no_relational_support);
                 printf("=========================================================================\n");
+
+                /* Read-Only Relational Candidate Generation Audit */
+                int gen_total_meaningful = 0;
+                int gen_gold_recovered = 0;
+                int gen_fully_supported_recovered = 0;
+                int gen_pos_only_recovered = 0;
+                int gen_no_support_recovered = 0;
+                size_t gen_total_candidates_emitted = 0;
+
+                for (size_t t = 0; t < limit; t++) {
+                    for (int rotation = 0; rotation < 3; rotation++) {
+                        int first_id = chain->triangles[t].word_ids[rotation];
+                        int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+                        int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+                        if (target_id <= 0) continue;
+
+                        ContextCandidate evidence[256];
+                        size_t count = context_graph_collect_candidate_evidence_relational(
+                            graph, rel_reg, first_id, second_id, rotation, evidence, 256);
+                        if (count == 0) continue;
+
+                        int in_candidates = 0;
+                        for (size_t c = 0; c < count; c++) {
+                            if (evidence[c].word_id == target_id) { in_candidates = 1; break; }
+                        }
+
+                        if (!in_candidates) {
+                            int seen_in_graph = 0;
+                            for (size_t i = 0; i < graph->node_count; i++) {
+                                const ContextNode *node = &graph->nodes[i];
+                                if (node->type == CONTEXT_TRIANGLE_NODE &&
+                                    node->word_ids[0] == first_id &&
+                                    node->word_ids[1] == second_id &&
+                                    node->rotation == rotation &&
+                                    node->word_ids[2] == target_id) {
+                                    seen_in_graph = 1;
+                                    break;
+                                }
+                            }
+                            if (!seen_in_graph && target_id > 0 && (size_t)target_id <= rel_reg->vocab_size) {
+                                gen_total_meaningful++;
+                                int target_position = (rotation >= 0) ? (rotation + 2) % 3 : 2;
+
+                                /* Relational Candidate Generator: Collect words matching position ratio >= 0.15 & transition > 0 */
+                                size_t generated_count = 0;
+                                int gold_in_generated = 0;
+
+                                for (size_t w = 1; w <= rel_reg->vocab_size; w++) {
+                                    const RelationalWordStats *w_stats = &rel_reg->word_stats[w];
+                                    double total_w = (double)(w_stats->left_count + w_stats->center_count + w_stats->right_count);
+                                    if (total_w <= 0.0) continue;
+
+                                    double pos_ratio = 0.0;
+                                    if (target_position == 0) pos_ratio = (double)w_stats->left_count / total_w;
+                                    else if (target_position == 1) pos_ratio = (double)w_stats->center_count / total_w;
+                                    else pos_ratio = (double)w_stats->right_count / total_w;
+
+                                    if (pos_ratio < 0.15) continue;
+
+                                    uint64_t fwd = 0, bwd = 0;
+                                    if (target_position == 2) {
+                                        fwd = relational_registry_get_transition_count(rel_reg, second_id, (int)w, 1);
+                                        bwd = relational_registry_get_transition_count(rel_reg, (int)w, second_id, 2);
+                                    } else if (target_position == 0) {
+                                        fwd = relational_registry_get_transition_count(rel_reg, (int)w, first_id, 0);
+                                        bwd = relational_registry_get_transition_count(rel_reg, first_id, (int)w, 3);
+                                    } else if (target_position == 1) {
+                                        fwd = relational_registry_get_transition_count(rel_reg, second_id, (int)w, 0);
+                                        bwd = relational_registry_get_transition_count(rel_reg, (int)w, second_id, 3);
+                                    }
+
+                                    if (fwd + bwd > 0) {
+                                        generated_count++;
+                                        if ((int)w == target_id) gold_in_generated = 1;
+                                    }
+                                }
+
+                                gen_total_candidates_emitted += generated_count;
+                                if (gold_in_generated) {
+                                    gen_gold_recovered++;
+
+                                    /* Categorize recovery group */
+                                    const RelationalWordStats *g_stats = &rel_reg->word_stats[target_id];
+                                    double g_total = (double)(g_stats->left_count + g_stats->center_count + g_stats->right_count);
+                                    double g_pos = 0.0;
+                                    if (g_total > 0.0) {
+                                        if (target_position == 0) g_pos = (double)g_stats->left_count / g_total;
+                                        else if (target_position == 1) g_pos = (double)g_stats->center_count / g_total;
+                                        else g_pos = (double)g_stats->right_count / g_total;
+                                    }
+                                    uint64_t g_fwd = 0, g_bwd = 0;
+                                    if (target_position == 2) {
+                                        g_fwd = relational_registry_get_transition_count(rel_reg, second_id, target_id, 1);
+                                        g_bwd = relational_registry_get_transition_count(rel_reg, target_id, second_id, 2);
+                                    } else if (target_position == 0) {
+                                        g_fwd = relational_registry_get_transition_count(rel_reg, target_id, first_id, 0);
+                                        g_bwd = relational_registry_get_transition_count(rel_reg, first_id, target_id, 3);
+                                    } else if (target_position == 1) {
+                                        g_fwd = relational_registry_get_transition_count(rel_reg, second_id, target_id, 0);
+                                        g_bwd = relational_registry_get_transition_count(rel_reg, target_id, second_id, 3);
+                                    }
+
+                                    if (g_pos >= 0.15 && (g_fwd + g_bwd > 0)) gen_fully_supported_recovered++;
+                                    else if (g_pos >= 0.15) gen_pos_only_recovered++;
+                                    else gen_no_support_recovered++;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                printf("\n=== Read-Only Relational Candidate Generation Audit ===\n");
+                printf("Meaningful exact-pair misses: %d\n", gen_total_meaningful);
+                printf("Position Threshold: 0.15 | Transition Threshold: > 0\n");
+                printf("Gold Target Recovered: %d / %d (%.1f%%)\n",
+                       gen_gold_recovered, gen_total_meaningful,
+                       gen_total_meaningful > 0 ? 100.0 * gen_gold_recovered / gen_total_meaningful : 0.0);
+                printf("Average Candidates Generated per Query: %.2f\n",
+                       gen_total_meaningful > 0 ? (double)gen_total_candidates_emitted / gen_total_meaningful : 0.0);
+                printf("  ├─ Fully-Supported Group (33): %d / 33 (%.1f%%)\n",
+                       gen_fully_supported_recovered,
+                       33 > 0 ? 100.0 * gen_fully_supported_recovered / 33.0 : 0.0);
+                printf("  ├─ Position-Only Group (38): %d / 38 (%.1f%%)\n",
+                       gen_pos_only_recovered,
+                       38 > 0 ? 100.0 * gen_pos_only_recovered / 38.0 : 0.0);
+                printf("  └─ No-Support Group (10): %d / 10 (%.1f%%)\n",
+                       gen_no_support_recovered,
+                       10 > 0 ? 100.0 * gen_no_support_recovered / 10.0 : 0.0);
+                printf("=======================================================\n");
             }
 
             if (gold_seen_in_train_count > 0) {
