@@ -462,7 +462,7 @@ void relational_registry_ingest_chain(RelationalRegistry *reg, const TriangleCha
         int w1 = t->word_ids[1];
         int w2 = t->word_ids[2];
 
-        /* Forward pass observations */
+        /* Structural position — record ONCE per spatial triangle */
         if (w0 > 0 && (size_t)w0 <= reg->vocab_size) {
             reg->word_stats[w0].left_count++;
             reg->word_stats[w0].total_count++;
@@ -476,28 +476,15 @@ void relational_registry_ingest_chain(RelationalRegistry *reg, const TriangleCha
             reg->word_stats[w2].total_count++;
         }
 
-        /* Forward transitions */
+        /* Forward relational transitions */
         record_transition(reg, w0, w1, 0); /* L -> C */
         record_transition(reg, w1, w2, 1); /* C -> R */
 
-        /* Backward pass observations */
-        if (w2 > 0 && (size_t)w2 <= reg->vocab_size) {
-            reg->word_stats[w2].left_count++;
-            reg->word_stats[w2].total_count++;
-        }
-        if (w1 > 0 && (size_t)w1 <= reg->vocab_size) {
-            reg->word_stats[w1].center_count++;
-            reg->word_stats[w1].total_count++;
-        }
-        if (w0 > 0 && (size_t)w0 <= reg->vocab_size) {
-            reg->word_stats[w0].right_count++;
-            reg->word_stats[w0].total_count++;
-        }
-
-        /* Backward transitions */
+        /* Backward relational transitions */
         record_transition(reg, w2, w1, 2); /* R -> C */
         record_transition(reg, w1, w0, 3); /* C -> L */
     }
+
 
     /* Update asymmetry scores */
     for (size_t w = 1; w <= reg->vocab_size; w++) {
