@@ -183,6 +183,61 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             }
         }
     }
+
+    if (use_mode_b && rel_reg && pair_queries > 0) {
+        double thresholds[7] = {0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30};
+        printf("\n=== Phase 2B Positional Filter Diagnostic Sweep ===\n");
+        printf("%-10s %-18s %-16s %-14s\n", "Threshold", "Avg Remaining Cand", "Gold Retention", "Reduction");
+        printf("-------------------------------------------------------------\n");
+        for (int t_idx = 0; t_idx < 7; t_idx++) {
+            double th = thresholds[t_idx];
+            size_t total_retained = 0;
+            int gold_retained_count = 0;
+
+            for (size_t t = 0; t < limit; t++) {
+                for (int rotation = 0; rotation < 3; rotation++) {
+                    int first_id = chain->triangles[t].word_ids[rotation];
+                    int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+                    int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+
+                    ContextCandidate evidence[256];
+                    size_t count = context_graph_collect_candidate_evidence_relational(
+                        graph, rel_reg, first_id, second_id, rotation, evidence, 256);
+                    if (count == 0) continue;
+
+                    int target_position = (rotation >= 0) ? (rotation + 2) % 3 : 2;
+                    size_t retained = 0;
+                    int gold_kept = 0;
+
+                    for (size_t c = 0; c < count; c++) {
+                        int cand_id = evidence[c].word_id;
+                        if (cand_id <= 0 || (size_t)cand_id > rel_reg->vocab_size) continue;
+                        const RelationalWordStats *stats = &rel_reg->word_stats[cand_id];
+                        double total_cnt = (double)(stats->left_count + stats->center_count + stats->right_count);
+                        double target_ratio = 0.0;
+                        if (total_cnt > 0.0) {
+                            if (target_position == 0) target_ratio = (double)stats->left_count / total_cnt;
+                            else if (target_position == 1) target_ratio = (double)stats->center_count / total_cnt;
+                            else target_ratio = (double)stats->right_count / total_cnt;
+                        }
+
+                        if (target_ratio >= th) {
+                            retained++;
+                            if (cand_id == target_id) gold_kept = 1;
+                        }
+                    }
+                    total_retained += retained;
+                    if (gold_kept) gold_retained_count++;
+                }
+            }
+            double avg_remaining = (double)total_retained / pair_queries;
+            double gold_retention = 100.0 * gold_retained_count / pair_queries;
+            double reduction = 100.0 * (1.0 - (double)total_retained / candidate_total);
+            printf("%-10.2f %-18.2f %-15.1f%% %-13.1f%%\n", th, avg_remaining, gold_retention, reduction);
+        }
+        printf("=============================================================\n");
+    }
+
     printf("\n=== Context Evaluation (%zu triangles) ===\n", limit);
     printf("Rotation queries: %d\n", total);
     if (total > 0) {
