@@ -2,7 +2,9 @@
 #define TRIANGLE_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include "word.h"
+
 
 #define TRIANGLE_ROLE_FEATURE_DIM 32
 
