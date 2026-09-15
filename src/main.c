@@ -369,10 +369,28 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                                 const char *w1 = vocab_get_word(chain->vocab, first_id);
                                 const char *w2 = vocab_get_word(chain->vocab, second_id);
                                 const char *gold = vocab_get_word(chain->vocab, target_id);
-                                const char *reason = (count >= 256) ? "256 Cap Truncation" : "Traversal/Scoping Miss";
+                                const char *reason = (count >= 256) ? "256 Cap Truncation" : "Non-Cap Retrieval Miss";
                                 printf("%-5d %-15s %-15s %-15s %-10zu %-12zu %-18s\n",
                                        rotation, w1 ? w1 : "?", w2 ? w2 : "?", gold ? gold : "?",
                                        count, uncapped_count, reason);
+
+                                if (count < 256) {
+                                    printf("  └── [Forensic Audit] Rot=%d Pair=[%s, %s] Target=%s (TargetID=%d)\n",
+                                           rotation, w1 ? w1 : "?", w2 ? w2 : "?", gold ? gold : "?", target_id);
+                                    size_t node_match_count = 0;
+                                    for (size_t i = 0; i < graph->node_count; i++) {
+                                        const ContextNode *node = &graph->nodes[i];
+                                        if (node->type == CONTEXT_TRIANGLE_NODE &&
+                                            node->word_ids[0] == first_id &&
+                                            node->word_ids[1] == second_id) {
+                                            node_match_count++;
+                                            printf("        ├─ Node #%d rot=%d: w0=%d w1=%d w2=%d (Gold %s)\n",
+                                                   node->id, node->rotation, node->word_ids[0], node->word_ids[1], node->word_ids[2],
+                                                   (node->word_ids[2] == target_id) ? "MATCH" : "diff");
+                                        }
+                                    }
+                                    printf("        └─ Total matching nodes found for pair: %zu\n", node_match_count);
+                                }
                             }
                         }
                     }
