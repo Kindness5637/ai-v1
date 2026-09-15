@@ -314,6 +314,30 @@ TriangleChain *create_triangles_from_conllu(const char *content) {
     return chain;
 }
 
+TriangleChain *create_triangles_from_conllu_with_vocab(const char *content,
+                                                       Vocabulary *vocab) {
+    if (!vocab) return NULL;
+    TriangleChain *chain = create_triangles_from_conllu(content);
+    if (!chain) return NULL;
+
+    Vocabulary *local_vocab = chain->vocab;
+    for (size_t i = 0; i < chain->count; i++) {
+        for (int p = 0; p < 3; p++) {
+            if (chain->triangles[i].word_ids[p] <= 0) continue;
+            chain->triangles[i].word_ids[p] =
+                vocab_get_or_add(vocab, chain->triangles[i].words[p]);
+        }
+    }
+    for (size_t i = 0; i < chain->registry->count; i++) {
+        chain->registry->entries[i].word_id =
+            vocab_get_or_add(vocab, chain->registry->entries[i].word);
+    }
+    vocab_free(local_vocab);
+    chain->vocab = vocab;
+    chain->owns_vocab = 0;
+    return chain;
+}
+
 void free_triangles(TriangleChain *chain) {
     if (!chain) return;
     for (size_t i = 0; i < chain->count; i++) {

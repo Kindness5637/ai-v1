@@ -91,6 +91,11 @@ static void fill_model_input(double *input, int slot, int word_id, int role_id,
     }
 }
 
+static int has_conllu_suffix(const char *filename) {
+    size_t length = strlen(filename);
+    return length >= 7 && strcmp(filename + length - 7, ".conllu") == 0;
+}
+
 static void evaluate_context_model(BackpropTrainer *trainer,
                                    const TriangleChain *chain,
                                    const ContextGraph *graph, size_t limit) {
@@ -216,8 +221,7 @@ int main(int argc, char *argv[]) {
         printf("Input: %s\n", filename);
     }
 
-    int is_conllu = strlen(filename) >= 7 &&
-        strcmp(filename + strlen(filename) - 7, ".conllu") == 0;
+    int is_conllu = has_conllu_suffix(filename);
     TriangleChain *chain = is_conllu
         ? create_triangles_from_conllu(file_content)
         : create_triangles(file_content);
@@ -660,11 +664,16 @@ int main(int argc, char *argv[]) {
                 free(extra_content);
             }
 
-            TriangleChain *train_chain = combined_train
-                ? create_triangles_with_vocab(combined_train, shared_vocab)
-                : NULL;
+            TriangleChain *train_chain = NULL;
+            if (combined_train) {
+                train_chain = has_conllu_suffix(filename)
+                    ? create_triangles_from_conllu_with_vocab(combined_train, shared_vocab)
+                    : create_triangles_with_vocab(combined_train, shared_vocab);
+            }
             free(combined_train);
-            TriangleChain *test_chain = create_triangles_with_vocab(test_content, shared_vocab);
+            TriangleChain *test_chain = has_conllu_suffix(argv[3])
+                ? create_triangles_from_conllu_with_vocab(test_content, shared_vocab)
+                : create_triangles_with_vocab(test_content, shared_vocab);
             if (!train_chain || !test_chain) {
                 fprintf(stderr, "Failed to create shared-vocabulary train/test chains\n");
                 free_triangles(train_chain);
