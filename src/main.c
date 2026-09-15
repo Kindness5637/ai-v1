@@ -534,6 +534,130 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                        gen_no_support_recovered,
                        10 > 0 ? 100.0 * gen_no_support_recovered / 10.0 : 0.0);
                 printf("=======================================================\n");
+
+                /* 2D Threshold Sweep: Position Ratio x Transition Count Cutoffs */
+                double pos_ths[3] = {0.15, 0.25, 0.35};
+                uint64_t trans_ths[4] = {1, 2, 3, 6}; /* >0, >1, >2, >5 */
+
+                printf("\n=== 2D Threshold Sweep: Candidate Reduction vs Gold Recovery (81 Misses) ===\n");
+                printf("%-10s %-12s %-20s %-20s %-15s\n", "Pos Thresh", "Trans Cutoff", "Gold Recovered", "Fully-Supp (33)", "Avg Candidates");
+                printf("-----------------------------------------------------------------------------------------\n");
+
+                for (int p_idx = 0; p_idx < 3; p_idx++) {
+                    for (int t_idx = 0; t_idx < 4; t_idx++) {
+                        double p_th = pos_ths[p_idx];
+                        uint64_t tr_th = trans_ths[t_idx];
+
+                        int sweep_gold_rec = 0;
+                        int sweep_fs_rec = 0;
+                        size_t sweep_cand_emitted = 0;
+
+                        for (size_t t = 0; t < limit; t++) {
+                            for (int rotation = 0; rotation < 3; rotation++) {
+                                int first_id = chain->triangles[t].word_ids[rotation];
+                                int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+                                int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+                                if (target_id <= 0) continue;
+
+                                ContextCandidate evidence[256];
+                                size_t count = context_graph_collect_candidate_evidence_relational(
+                                    graph, rel_reg, first_id, second_id, rotation, evidence, 256);
+                                if (count == 0) continue;
+
+                                int in_candidates = 0;
+                                for (size_t c = 0; c < count; c++) {
+                                    if (evidence[c].word_id == target_id) { in_candidates = 1; break; }
+                                }
+
+                                if (!in_candidates) {
+                                    int seen_in_graph = 0;
+                                    for (size_t i = 0; i < graph->node_count; i++) {
+                                        const ContextNode *node = &graph->nodes[i];
+                                        if (node->type == CONTEXT_TRIANGLE_NODE &&
+                                            node->word_ids[0] == first_id &&
+                                            node->word_ids[1] == second_id &&
+                                            node->rotation == rotation &&
+                                            node->word_ids[2] == target_id) {
+                                            seen_in_graph = 1;
+                                            break;
+                                        }
+                                    }
+                                    if (!seen_in_graph && target_id > 0 && (size_t)target_id <= rel_reg->vocab_size) {
+                                        int target_position = (rotation >= 0) ? (rotation + 2) % 3 : 2;
+                                        size_t generated_count = 0;
+                                        int gold_in_generated = 0;
+
+                                        for (size_t w = 1; w <= rel_reg->vocab_size; w++) {
+                                            const RelationalWordStats *w_stats = &rel_reg->word_stats[w];
+                                            double total_w = (double)(w_stats->left_count + w_stats->center_count + w_stats->right_count);
+                                            if (total_w <= 0.0) continue;
+
+                                            double pos_ratio = 0.0;
+                                            if (target_position == 0) pos_ratio = (double)w_stats->left_count / total_w;
+                                            else if (target_position == 1) pos_ratio = (double)w_stats->center_count / total_w;
+                                            else pos_ratio = (double)w_stats->right_count / total_w;
+
+                                            if (pos_ratio < p_th) continue;
+
+                                            uint64_t fwd = 0, bwd = 0;
+                                            if (target_position == 2) {
+                                                fwd = relational_registry_get_transition_count(rel_reg, second_id, (int)w, 1);
+                                                bwd = relational_registry_get_transition_count(rel_reg, (int)w, second_id, 2);
+                                            } else if (target_position == 0) {
+                                                fwd = relational_registry_get_transition_count(rel_reg, (int)w, first_id, 0);
+                                                bwd = relational_registry_get_transition_count(rel_reg, first_id, (int)w, 3);
+                                            } else if (target_position == 1) {
+                                                fwd = relational_registry_get_transition_count(rel_reg, second_id, (int)w, 0);
+                                                bwd = relational_registry_get_transition_count(rel_reg, (int)w, second_id, 3);
+                                            }
+
+                                            if (fwd + bwd >= tr_th) {
+                                                generated_count++;
+                                                if ((int)w == target_id) gold_in_generated = 1;
+                                            }
+                                        }
+
+                                        sweep_cand_emitted += generated_count;
+                                        if (gold_in_generated) {
+                                            sweep_gold_rec++;
+
+                                            const RelationalWordStats *g_stats = &rel_reg->word_stats[target_id];
+                                            double g_total = (double)(g_stats->left_count + g_stats->center_count + g_stats->right_count);
+                                            double g_pos = 0.0;
+                                            if (g_total > 0.0) {
+                                                if (target_position == 0) g_pos = (double)g_stats->left_count / g_total;
+                                                else if (target_position == 1) g_pos = (double)g_stats->center_count / g_total;
+                                                else g_pos = (double)g_stats->right_count / g_total;
+                                            }
+                                            uint64_t g_fwd = 0, g_bwd = 0;
+                                            if (target_position == 2) {
+                                                g_fwd = relational_registry_get_transition_count(rel_reg, second_id, target_id, 1);
+                                                g_bwd = relational_registry_get_transition_count(rel_reg, target_id, second_id, 2);
+                                            } else if (target_position == 0) {
+                                                g_fwd = relational_registry_get_transition_count(rel_reg, target_id, first_id, 0);
+                                                g_bwd = relational_registry_get_transition_count(rel_reg, first_id, target_id, 3);
+                                            } else if (target_position == 1) {
+                                                g_fwd = relational_registry_get_transition_count(rel_reg, second_id, target_id, 0);
+                                                g_bwd = relational_registry_get_transition_count(rel_reg, target_id, second_id, 3);
+                                            }
+
+                                            if (g_pos >= 0.15 && (g_fwd + g_bwd > 0)) sweep_fs_rec++;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        char cutoff_str[16];
+                        snprintf(cutoff_str, sizeof(cutoff_str), ">= %llu", (unsigned long long)tr_th);
+                        printf("%-10.2f %-12s %d / 81 (%.1f%%)   %d / 33 (%.1f%%)   %.2f\n",
+                               p_th, cutoff_str,
+                               sweep_gold_rec, gen_total_meaningful > 0 ? 100.0 * sweep_gold_rec / gen_total_meaningful : 0.0,
+                               sweep_fs_rec, 33.0 > 0.0 ? 100.0 * sweep_fs_rec / 33.0 : 0.0,
+                               gen_total_meaningful > 0 ? (double)sweep_cand_emitted / gen_total_meaningful : 0.0);
+                    }
+                }
+                printf("================================================-----------------------------------------\n");
             }
 
             if (gold_seen_in_train_count > 0) {
