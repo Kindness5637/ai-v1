@@ -25,6 +25,20 @@ static int model_word_id(int vocabulary_id, int vocab_size) {
     return vocabulary_id - 1;
 }
 
+static void fill_token_features(double *input, int offset, int word_id,
+                                int role_id, const BackpropNetwork *network) {
+    int feature_dim = network->embed_dim + TRIANGLE_ROLE_FEATURE_DIM;
+    int word_index = model_word_id(word_id, network->vocab_size);
+    for (int d = 0; d < network->embed_dim; d++) {
+        input[offset * feature_dim + d] =
+            network->embeddings[word_index * network->embed_dim + d];
+    }
+    for (int r = 0; r < TRIANGLE_ROLE_FEATURE_DIM; r++) {
+        input[offset * feature_dim + network->embed_dim + r] =
+            (role_id == r + 1) ? 1.0 : 0.0;
+    }
+}
+
 BackpropTrainer *backprop_create(int vocab_size, int embed_dim, int hidden_size, int output_size, int max_epochs, double lr) {
     BackpropTrainer *trainer = malloc(sizeof(BackpropTrainer));
     if (!trainer) return NULL;
@@ -45,7 +59,7 @@ BackpropTrainer *backprop_create(int vocab_size, int embed_dim, int hidden_size,
         return NULL;
     }
 
-    int input_size = 2 * embed_dim;
+    int input_size = 2 * (embed_dim + TRIANGLE_ROLE_FEATURE_DIM);
     trainer->network->vocab_size = vocab_size;
     trainer->network->embed_dim = embed_dim;
     trainer->network->input_size = input_size;
@@ -157,11 +171,9 @@ void backprop_train(BackpropTrainer *trainer, const TriangleChain *chain) {
                     for (int target_position = 0; target_position < 3; target_position++) {
                         for (int q = 0; q < 2; q++) {
                             int source_position = (target_position + q + 1) % 3;
-                            int wid = w_ids[source_position];
-                            for (int d = 0; d < nn->embed_dim; d++) {
-                                local_input[q * nn->embed_dim + d] =
-                                    nn->embeddings[wid * nn->embed_dim + d];
-                            }
+                            fill_token_features(local_input, q,
+                                chain->triangles[t].word_ids[source_position],
+                                chain->triangles[t].role_ids[source_position], nn);
                         }
 
                         double target[nn->output_size];

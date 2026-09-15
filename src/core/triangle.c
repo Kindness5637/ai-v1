@@ -48,6 +48,19 @@ static char *str_to_lower(const char *str) {
     return lower;
 }
 
+int triangle_role_id(const char *upos) {
+    static const char *roles[] = {
+        "", "ADJ", "ADP", "ADV", "AUX", "CCONJ", "DET", "INTJ",
+        "NOUN", "NUM", "PART", "PRON", "PROPN", "PUNCT", "SCONJ",
+        "SYM", "VERB", "X"
+    };
+    if (!upos) return 0;
+    for (int i = 1; i < (int)(sizeof(roles) / sizeof(roles[0])); i++) {
+        if (strcmp(upos, roles[i]) == 0) return i;
+    }
+    return 0;
+}
+
 TriangleChain *create_triangles(const char *sentence) {
     size_t word_count = 0;
     char **words = tokenize(sentence, &word_count);
@@ -94,11 +107,13 @@ TriangleChain *create_triangles(const char *sentence) {
                 chain->triangles[i].words[j] = lower;
                 int word_id = vocab_get_or_add(chain->vocab, lower);
                 chain->triangles[i].word_ids[j] = word_id;
+                chain->triangles[i].role_ids[j] = 0;
                 registry_add(chain->registry, word_id, i + 1, j, lower);
                 word_idx++;
             } else {
                 chain->triangles[i].words[j] = strdup("-");
                 chain->triangles[i].word_ids[j] = 0;
+                chain->triangles[i].role_ids[j] = 0;
             }
         }
     }
@@ -164,6 +179,7 @@ static int append_conllu_sentence(TriangleChain *chain,
                 if (!lower) return 0;
                 triangle->words[p] = lower;
                 triangle->word_ids[p] = vocab_get_or_add(chain->vocab, lower);
+                triangle->role_ids[p] = triangle_role_id(tokens[token_index].upos);
                 registry_add(chain->registry, triangle->word_ids[p],
                              (size_t)triangle->id, p, lower);
                 strncpy(triangle->upos[p], tokens[token_index].upos,
@@ -176,6 +192,7 @@ static int append_conllu_sentence(TriangleChain *chain,
                 triangle->words[p] = strdup("-");
                 if (!triangle->words[p]) return 0;
                 triangle->word_ids[p] = 0;
+                triangle->role_ids[p] = 0;
                 triangle->upos[p][0] = '\0';
                 triangle->deprel[p][0] = '\0';
             }

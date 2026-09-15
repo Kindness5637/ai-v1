@@ -75,6 +75,22 @@ static int nearest_word_id(const BackpropNetwork *network, const double *vector)
     return best + 1;
 }
 
+static void fill_model_input(double *input, int slot, int word_id, int role_id,
+                             const BackpropNetwork *network) {
+    int feature_dim = network->embed_dim + TRIANGLE_ROLE_FEATURE_DIM;
+    int word_index = word_id - 1;
+    if (word_index < 0) word_index = 0;
+    if (word_index >= network->vocab_size) word_index = network->vocab_size - 1;
+    for (int d = 0; d < network->embed_dim; d++) {
+        input[slot * feature_dim + d] =
+            network->embeddings[word_index * network->embed_dim + d];
+    }
+    for (int r = 0; r < TRIANGLE_ROLE_FEATURE_DIM; r++) {
+        input[slot * feature_dim + network->embed_dim + r] =
+            role_id == r + 1 ? 1.0 : 0.0;
+    }
+}
+
 static void evaluate_context_model(BackpropTrainer *trainer,
                                    const TriangleChain *chain,
                                    const ContextGraph *graph, size_t limit) {
@@ -88,7 +104,7 @@ static void evaluate_context_model(BackpropTrainer *trainer,
     size_t candidate_total = 0;
     int candidate_ids[256];
     int embed_dim = trainer->network->embed_dim;
-    double *input = calloc(2 * embed_dim, sizeof(double));
+    double *input = calloc(trainer->network->input_size, sizeof(double));
     double *output = calloc(trainer->network->output_size, sizeof(double));
 
     for (size_t t = 0; t < limit; t++) {
@@ -107,10 +123,10 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             ContextCandidate evidence[256];
             size_t evidence_count = context_graph_collect_candidate_evidence(
                 graph, first_id, second_id, evidence, 256);
-            for (int d = 0; d < embed_dim; d++) {
-                input[d] = trainer->network->embeddings[(first_id - 1) * embed_dim + d];
-                input[embed_dim + d] = trainer->network->embeddings[(second_id - 1) * embed_dim + d];
-            }
+            fill_model_input(input, 0, first_id,
+                             chain->triangles[t].role_ids[rotation], trainer->network);
+            fill_model_input(input, 1, second_id,
+                             chain->triangles[t].role_ids[(rotation + 1) % 3], trainer->network);
             backprop_predict(trainer, input, output);
             double scores[256];
             double target_score = -INFINITY;
@@ -427,15 +443,11 @@ int main(int argc, char *argv[]) {
             if (candidate_count == 0) {
                 printf("No graph candidates found for [%s, %s].\n", argv[3], argv[4]);
             } else {
-                int first_index = first_id - 1;
-                int second_index = second_id - 1;
                 int embed_dim = trainer->network->embed_dim;
-                double *input = calloc(2 * embed_dim, sizeof(double));
+                double *input = calloc(trainer->network->input_size, sizeof(double));
                 double *output = calloc(trainer->network->output_size, sizeof(double));
-                for (int d = 0; d < embed_dim; d++) {
-                    input[d] = trainer->network->embeddings[first_index * embed_dim + d];
-                    input[embed_dim + d] = trainer->network->embeddings[second_index * embed_dim + d];
-                }
+                fill_model_input(input, 0, first_id, 0, trainer->network);
+                fill_model_input(input, 1, second_id, 0, trainer->network);
                 backprop_predict(trainer, input, output);
 
                 double candidate_distances[256];
@@ -531,7 +543,7 @@ int main(int argc, char *argv[]) {
             int total = 0;
             int candidate_ids[256];
             int embed_dim = trainer->network->embed_dim;
-            double *input = calloc(2 * embed_dim, sizeof(double));
+            double *input = calloc(trainer->network->input_size, sizeof(double));
             double *output = calloc(trainer->network->output_size, sizeof(double));
 
             for (size_t t = 0; t < limit; t++) {
@@ -548,10 +560,10 @@ int main(int argc, char *argv[]) {
                         context_graph, first_id, second_id, evidence, 256);
                     double candidate_scores[256];
                     double target_score = -INFINITY;
-                    for (int d = 0; d < embed_dim; d++) {
-                        input[d] = trainer->network->embeddings[(first_id - 1) * embed_dim + d];
-                        input[embed_dim + d] = trainer->network->embeddings[(second_id - 1) * embed_dim + d];
-                    }
+                    fill_model_input(input, 0, first_id,
+                                     chain->triangles[t].role_ids[rotation], trainer->network);
+                    fill_model_input(input, 1, second_id,
+                                     chain->triangles[t].role_ids[(rotation + 1) % 3], trainer->network);
                     backprop_predict(trainer, input, output);
                     for (size_t c = 0; c < candidate_count; c++) {
                         double distance = 0.0;
@@ -803,16 +815,13 @@ int main(int argc, char *argv[]) {
         for (size_t t = 0; t < 10 && t < chain->count; t++) {
             int pred_ids[3];
             for (int target_position = 0; target_position < 3; target_position++) {
-                double input[2 * 32];
+                double input[2 * (32 + TRIANGLE_ROLE_FEATURE_DIM)];
                 for (int q = 0; q < 2; q++) {
                     int source_position = (target_position + q + 1) % 3;
-                    int wid = chain->triangles[t].word_ids[source_position] - 1;
-                    if (wid < 0) wid = 0;
-                    if (wid >= vocab_size) wid = vocab_size - 1;
-                    for (int d = 0; d < embed_dim; d++) {
-                        input[q * embed_dim + d] =
-                            trainer->network->embeddings[wid * embed_dim + d];
-                    }
+                    fill_model_input(input, q,
+                                     chain->triangles[t].word_ids[source_position],
+                                     chain->triangles[t].role_ids[source_position],
+                                     trainer->network);
                 }
 
                 double output[3 * 32];

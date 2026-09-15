@@ -33,7 +33,7 @@ __device__ static double device_sigmoid(double x) {
 }
 
 __global__ static void train_kernel(
-    const int *word_ids, const double *embeddings,
+    const int *word_ids, const int *role_ids, const double *embeddings,
     const double *weights_ih, const double *weights_ho,
     const double *bias_h, const double *bias_o,
     double *grad_ih, double *grad_ho, double *grad_bias_h,
@@ -62,9 +62,16 @@ __global__ static void train_kernel(
 
     int word_a = word_ids[triangle * 3 + source_a];
     int word_b = word_ids[triangle * 3 + source_b];
+    int feature_dim = embed_dim + TRIANGLE_ROLE_FEATURE_DIM;
     for (int d = 0; d < embed_dim; d++) {
         input[d] = embeddings[word_a * embed_dim + d];
-        input[embed_dim + d] = embeddings[word_b * embed_dim + d];
+        input[feature_dim + d] = embeddings[word_b * embed_dim + d];
+    }
+    for (int r = 0; r < TRIANGLE_ROLE_FEATURE_DIM; r++) {
+        input[embed_dim + r] =
+            role_ids[triangle * 3 + source_a] == r + 1 ? 1.0 : 0.0;
+        input[feature_dim + embed_dim + r] =
+            role_ids[triangle * 3 + source_b] == r + 1 ? 1.0 : 0.0;
     }
 
     for (int h = 0; h < hidden_size; h++) {
@@ -163,6 +170,7 @@ __global__ static void train_kernel(
 struct DeviceState {
     int device;
     int *word_ids;
+    int *role_ids;
     double *embeddings, *weights_ih, *weights_ho, *bias_h, *bias_o;
     double *grad_ih, *grad_ho, *grad_bias_h, *grad_bias_o, *grad_embeddings, *loss;
     double *host_grad_ih, *host_grad_ho, *host_grad_bias_h, *host_grad_bias_o, *host_grad_embeddings;
@@ -186,7 +194,7 @@ static void normalize_embeddings(BackpropNetwork *network) {
 
 static void allocate_state(DeviceState *state, int device,
                            const TriangleChain *chain, const BackpropNetwork *nn,
-                           const int *word_ids) {
+                           const int *word_ids, const int *role_ids) {
     state->device = device;
     cuda_check(cudaSetDevice(device), "cudaSetDevice");
     size_t words_bytes = chain->count * 3 * sizeof(int);
@@ -197,6 +205,7 @@ static void allocate_state(DeviceState *state, int device,
     size_t bo_bytes = nn->output_size * sizeof(double);
 
     cuda_check(cudaMalloc(&state->word_ids, words_bytes), "word_ids");
+    cuda_check(cudaMalloc(&state->role_ids, words_bytes), "role_ids");
     cuda_check(cudaMalloc(&state->embeddings, embedding_bytes), "embeddings");
     cuda_check(cudaMalloc(&state->weights_ih, ih_bytes), "weights_ih");
     cuda_check(cudaMalloc(&state->weights_ho, ho_bytes), "weights_ho");
@@ -210,6 +219,7 @@ static void allocate_state(DeviceState *state, int device,
     cuda_check(cudaMalloc(&state->loss, sizeof(double)), "loss");
 
     cuda_check(cudaMemcpy(state->word_ids, word_ids, words_bytes, cudaMemcpyHostToDevice), "copy word_ids");
+    cuda_check(cudaMemcpy(state->role_ids, role_ids, words_bytes, cudaMemcpyHostToDevice), "copy role_ids");
     cuda_check(cudaMemcpy(state->embeddings, nn->embeddings, embedding_bytes, cudaMemcpyHostToDevice), "copy embeddings");
 
     state->host_grad_ih = (double *)malloc(ih_bytes);
@@ -222,6 +232,7 @@ static void allocate_state(DeviceState *state, int device,
 static void free_state(DeviceState *state) {
     cudaSetDevice(state->device);
     cudaFree(state->word_ids); cudaFree(state->embeddings);
+    cudaFree(state->role_ids);
     cudaFree(state->weights_ih); cudaFree(state->weights_ho);
     cudaFree(state->bias_h); cudaFree(state->bias_o);
     cudaFree(state->grad_ih); cudaFree(state->grad_ho);
@@ -249,17 +260,20 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
 
     size_t triangle_count = chain->count;
     int *word_ids = (int *)malloc(triangle_count * 3 * sizeof(int));
+    int *role_ids = (int *)malloc(triangle_count * 3 * sizeof(int));
     for (size_t t = 0; t < triangle_count; t++) {
         for (int p = 0; p < 3; p++) {
             int id = chain->triangles[t].word_ids[p] - 1;
             if (id < 0) id = 0;
             if (id >= nn->vocab_size) id = nn->vocab_size - 1;
             word_ids[t * 3 + p] = id;
+            role_ids[t * 3 + p] = chain->triangles[t].role_ids[p];
         }
     }
 
     DeviceState *states = (DeviceState *)calloc(gpu_count, sizeof(DeviceState));
-    for (int g = 0; g < gpu_count; g++) allocate_state(&states[g], g, chain, nn, word_ids);
+    for (int g = 0; g < gpu_count; g++)
+        allocate_state(&states[g], g, chain, nn, word_ids, role_ids);
 
     size_t ih_count = nn->input_size * nn->hidden_size;
     size_t ho_count = nn->hidden_size * nn->output_size;
@@ -302,7 +316,7 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
 
             int blocks = (end - start + block_size - 1) / block_size;
             train_kernel<<<blocks, block_size>>>(
-                state->word_ids, state->embeddings, state->weights_ih,
+                state->word_ids, state->role_ids, state->embeddings, state->weights_ih,
                 state->weights_ho, state->bias_h, state->bias_o,
                 state->grad_ih, state->grad_ho, state->grad_bias_h,
                 state->grad_bias_o, state->grad_embeddings, state->loss, (int)triangle_count,
@@ -344,6 +358,6 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
     }
 
     for (int g = 0; g < gpu_count; g++) free_state(&states[g]);
-    free(states); free(word_ids); free(sum_ih); free(sum_ho); free(sum_bh); free(sum_bo); free(sum_embeddings);
+    free(states); free(word_ids); free(role_ids); free(sum_ih); free(sum_ho); free(sum_bh); free(sum_bo); free(sum_embeddings);
     return 0;
 }
