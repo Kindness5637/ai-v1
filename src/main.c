@@ -53,6 +53,7 @@ void print_usage(void) {
     printf("  ./triangle.out <train> -heldout <test> [train2 ...] - Multi-document held-out experiment\n");
     printf("  ./triangle.out <old> -learn <new>  - Learn from new text using old as base\n");
     printf("  ./triangle.out <file> -backprop    - Train with backpropagation\n");
+    printf("  .conllu files use FORM, UPOS, and DEPREL role metadata\n");
 }
 
 static int nearest_word_id(const BackpropNetwork *network, const double *vector) {
@@ -199,7 +200,11 @@ int main(int argc, char *argv[]) {
         printf("Input: %s\n", filename);
     }
 
-    TriangleChain *chain = create_triangles(file_content);
+    int is_conllu = strlen(filename) >= 7 &&
+        strcmp(filename + strlen(filename) - 7, ".conllu") == 0;
+    TriangleChain *chain = is_conllu
+        ? create_triangles_from_conllu(file_content)
+        : create_triangles(file_content);
     if (!chain) {
         fprintf(stderr, "Failed to create triangles\n");
         free(file_content);

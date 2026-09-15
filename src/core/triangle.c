@@ -132,6 +132,171 @@ TriangleChain *create_triangles_with_vocab(const char *sentence, Vocabulary *voc
     return chain;
 }
 
+typedef struct {
+    char *form;
+    char upos[16];
+    char deprel[32];
+} ConlluToken;
+
+static void free_conllu_tokens(ConlluToken *tokens, size_t count) {
+    if (!tokens) return;
+    for (size_t i = 0; i < count; i++) free(tokens[i].form);
+    free(tokens);
+}
+
+static int append_conllu_sentence(TriangleChain *chain,
+                                  ConlluToken *tokens, size_t token_count) {
+    if (!chain || token_count == 0) return 1;
+
+    size_t triangle_count = (token_count + 2) / 3;
+    Triangle *grown = realloc(chain->triangles,
+                              (chain->count + triangle_count) * sizeof(Triangle));
+    if (!grown) return 0;
+    chain->triangles = grown;
+
+    for (size_t i = 0; i < triangle_count; i++) {
+        Triangle *triangle = &chain->triangles[chain->count + i];
+        triangle->id = (int)(chain->count + i + 1);
+        for (int p = 0; p < 3; p++) {
+            size_t token_index = i * 3 + (size_t)p;
+            if (token_index < token_count) {
+                char *lower = str_to_lower(tokens[token_index].form);
+                if (!lower) return 0;
+                triangle->words[p] = lower;
+                triangle->word_ids[p] = vocab_get_or_add(chain->vocab, lower);
+                registry_add(chain->registry, triangle->word_ids[p],
+                             (size_t)triangle->id, p, lower);
+                strncpy(triangle->upos[p], tokens[token_index].upos,
+                        sizeof(triangle->upos[p]) - 1);
+                triangle->upos[p][sizeof(triangle->upos[p]) - 1] = '\0';
+                strncpy(triangle->deprel[p], tokens[token_index].deprel,
+                        sizeof(triangle->deprel[p]) - 1);
+                triangle->deprel[p][sizeof(triangle->deprel[p]) - 1] = '\0';
+            } else {
+                triangle->words[p] = strdup("-");
+                if (!triangle->words[p]) return 0;
+                triangle->word_ids[p] = 0;
+                triangle->upos[p][0] = '\0';
+                triangle->deprel[p][0] = '\0';
+            }
+        }
+    }
+    chain->count += triangle_count;
+    return 1;
+}
+
+TriangleChain *create_triangles_from_conllu(const char *content) {
+    if (!content) return NULL;
+
+    TriangleChain *chain = calloc(1, sizeof(TriangleChain));
+    if (!chain) return NULL;
+    chain->vocab = vocab_create();
+    chain->registry = registry_create();
+    chain->owns_vocab = 1;
+    if (!chain->vocab || !chain->registry) {
+        vocab_free(chain->vocab);
+        registry_free(chain->registry);
+        free(chain);
+        return NULL;
+    }
+
+    char *copy = strdup(content);
+    if (!copy) {
+        free_triangles(chain);
+        return NULL;
+    }
+
+    ConlluToken *tokens = NULL;
+    size_t token_count = 0, token_capacity = 0;
+    char *line_save = NULL;
+    char *line = strtok_r(copy, "\n", &line_save);
+    while (line) {
+        while (*line == '\r') line++;
+        if (*line == '\0') {
+            if (!append_conllu_sentence(chain, tokens, token_count)) {
+                free_conllu_tokens(tokens, token_count);
+                free(copy);
+                free_triangles(chain);
+                return NULL;
+            }
+            free_conllu_tokens(tokens, token_count);
+            tokens = NULL;
+            token_count = 0;
+            token_capacity = 0;
+            line = strtok_r(NULL, "\n", &line_save);
+            continue;
+        }
+        if (*line == '#') {
+            if (strncmp(line, "# sent_id", 9) == 0 && token_count > 0) {
+                if (!append_conllu_sentence(chain, tokens, token_count)) {
+                    free_conllu_tokens(tokens, token_count);
+                    free(copy);
+                    free_triangles(chain);
+                    return NULL;
+                }
+                free_conllu_tokens(tokens, token_count);
+                tokens = NULL;
+                token_count = 0;
+                token_capacity = 0;
+            }
+            line = strtok_r(NULL, "\n", &line_save);
+            continue;
+        }
+
+        char *fields[10] = {0};
+        char *field_save = NULL;
+        char *field = strtok_r(line, "\t", &field_save);
+        int field_count = 0;
+        while (field && field_count < 10) {
+            fields[field_count++] = field;
+            field = strtok_r(NULL, "\t", &field_save);
+        }
+        /* Skip multi-word-token and empty-node rows; only syntactic word
+         * rows receive triangle vertices. */
+        if (field_count == 10 && strchr(fields[0], '-') == NULL &&
+            strchr(fields[0], '.') == NULL) {
+            if (token_count == token_capacity) {
+                size_t next_capacity = token_capacity ? token_capacity * 2 : 64;
+                ConlluToken *grown = realloc(tokens,
+                                             next_capacity * sizeof(ConlluToken));
+                if (!grown) {
+                    free_conllu_tokens(tokens, token_count);
+                    free(copy);
+                    free_triangles(chain);
+                    return NULL;
+                }
+                tokens = grown;
+                token_capacity = next_capacity;
+            }
+            tokens[token_count].form = strdup(fields[1]);
+            if (!tokens[token_count].form) {
+                free_conllu_tokens(tokens, token_count);
+                free(copy);
+                free_triangles(chain);
+                return NULL;
+            }
+            strncpy(tokens[token_count].upos, fields[3],
+                    sizeof(tokens[token_count].upos) - 1);
+            tokens[token_count].upos[sizeof(tokens[token_count].upos) - 1] = '\0';
+            strncpy(tokens[token_count].deprel, fields[7],
+                    sizeof(tokens[token_count].deprel) - 1);
+            tokens[token_count].deprel[sizeof(tokens[token_count].deprel) - 1] = '\0';
+            token_count++;
+        }
+        line = strtok_r(NULL, "\n", &line_save);
+    }
+
+    if (!append_conllu_sentence(chain, tokens, token_count)) {
+        free_conllu_tokens(tokens, token_count);
+        free(copy);
+        free_triangles(chain);
+        return NULL;
+    }
+    free_conllu_tokens(tokens, token_count);
+    free(copy);
+    return chain;
+}
+
 void free_triangles(TriangleChain *chain) {
     if (!chain) return;
     for (size_t i = 0; i < chain->count; i++) {
@@ -162,6 +327,12 @@ void print_triangles(const TriangleChain *chain) {
                chain->triangles[i].word_ids[1],
                chain->triangles[i].words[2],
                chain->triangles[i].word_ids[2]);
+        if (chain->triangles[i].upos[0][0] != '\0') {
+            printf("    Roles: %s/%s, %s/%s, %s/%s\n",
+                   chain->triangles[i].upos[0], chain->triangles[i].deprel[0],
+                   chain->triangles[i].upos[1], chain->triangles[i].deprel[1],
+                   chain->triangles[i].upos[2], chain->triangles[i].deprel[2]);
+        }
     }
 }
 
