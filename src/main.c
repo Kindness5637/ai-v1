@@ -187,8 +187,8 @@ static void evaluate_context_model(BackpropTrainer *trainer,
     if (use_mode_b && rel_reg && pair_queries > 0) {
         double thresholds[7] = {0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30};
         printf("\n=== Phase 2B Positional Filter Diagnostic Sweep ===\n");
-        printf("%-10s %-18s %-16s %-14s\n", "Threshold", "Avg Remaining Cand", "Gold Retention", "Reduction");
-        printf("-------------------------------------------------------------\n");
+        printf("%-10s %-18s %-24s %-14s\n", "Threshold", "Avg Remaining Cand", "Cond Gold Retention", "Reduction");
+        printf("-----------------------------------------------------------------------\n");
         for (int t_idx = 0; t_idx < 7; t_idx++) {
             double th = thresholds[t_idx];
             size_t total_retained = 0;
@@ -233,9 +233,9 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             double avg_remaining = (double)total_retained / pair_queries;
             double gold_retention = 100.0 * gold_retained_count / pair_queries;
             double reduction = 100.0 * (1.0 - (double)total_retained / candidate_total);
-            printf("%-10.2f %-18.2f %-15.1f%% %-13.1f%%\n", th, avg_remaining, gold_retention, reduction);
+            printf("%-10.2f %-18.2f %-23.1f%% %-13.1f%%\n", th, avg_remaining, gold_retention, reduction);
         }
-        printf("=============================================================\n");
+        printf("================================================-----------------------\n");
     }
 
     printf("\n=== Context Evaluation (%zu triangles) ===\n", limit);
