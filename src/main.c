@@ -258,6 +258,18 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                    100.0 * neural_top1 / pair_queries);
             printf("Conditional neural top-5: %.1f%%\n",
                    100.0 * neural_top5 / pair_queries);
+
+            printf("\n=== Candidate Discovery & Graph Recall Loss Analysis ===\n");
+            printf("Total Rotation Queries: %d\n", total);
+            printf("  ├─ Known Context Pair Queries (Covered): %d (%.1f%%)\n",
+                   pair_queries, 100.0 * pair_queries / total);
+            printf("  │   ├─ Graph Recall Hits (Gold in Graph): %d (%.1f%% of covered)\n",
+                   graph_hits, 100.0 * graph_hits / pair_queries);
+            printf("  │   └─ Graph Recall Misses (Gold absent in covered graph): %d (%.1f%% of covered)\n",
+                   pair_queries - graph_hits, 100.0 * (pair_queries - graph_hits) / pair_queries);
+            printf("  └─ Unseen Context Pair Queries (Uncovered): %d (%.1f%%)\n",
+                   total - pair_queries, 100.0 * (total - pair_queries) / total);
+            printf("=========================================================\n");
         }
     }
     free(input);
