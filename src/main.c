@@ -98,7 +98,10 @@ static int has_conllu_suffix(const char *filename) {
 
 static void evaluate_context_model(BackpropTrainer *trainer,
                                    const TriangleChain *chain,
-                                   const ContextGraph *graph, size_t limit) {
+                                   const ContextGraph *graph,
+                                   const RelationalRegistry *rel_reg,
+                                   int use_mode_b,
+                                   size_t limit) {
     if (!graph) {
         printf("Unable to create evaluation context graph.\n");
         return;
@@ -117,53 +120,57 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             int first_id = chain->triangles[t].word_ids[rotation];
             int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
             int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
-            int first_role = chain->triangles[t].role_ids[rotation];
-            int second_role = chain->triangles[t].role_ids[(rotation + 1) % 3];
-            size_t count = context_graph_collect_candidates_fallback(
-                graph, first_id, first_role, second_id, second_role, rotation,
-                candidate_ids, 256);
+            int first_role = use_mode_b ? 0 : chain->triangles[t].role_ids[rotation];
+            int second_role = use_mode_b ? 0 : chain->triangles[t].role_ids[(rotation + 1) % 3];
+
+            ContextCandidate evidence[256];
+            size_t count = 0;
+            if (use_mode_b) {
+                count = context_graph_collect_candidate_evidence_relational(
+                    graph, rel_reg, first_id, second_id, rotation, evidence, 256);
+            } else {
+                count = context_graph_collect_candidate_evidence_fallback(
+                    graph, first_id, first_role, second_id, second_role, rotation,
+                    evidence, 256);
+            }
             total++;
             if (count == 0) continue;
             pair_queries++;
             candidate_total += count;
             if (count > 1) ambiguous_pairs++;
             if ((int)count > max_candidates) max_candidates = (int)count;
-            ContextCandidate evidence[256];
-            size_t evidence_count = context_graph_collect_candidate_evidence_fallback(
-                graph, first_id, first_role, second_id, second_role, rotation,
-                evidence, 256);
+
             fill_model_input(input, 0, first_id, first_role, trainer->network);
             fill_model_input(input, 1, second_id, second_role, trainer->network);
+
             backprop_predict(trainer, input, output);
             double scores[256];
             double target_score = -INFINITY;
             int found = 0;
             for (size_t c = 0; c < count; c++) {
+                int cand_word_id = evidence[c].word_id;
+                candidate_ids[c] = cand_word_id;
                 double distance = 0.0;
                 for (int d = 0; d < embed_dim; d++) {
                     double delta = output[2 * embed_dim + d] -
-                        trainer->network->embeddings[(candidate_ids[c] - 1) * embed_dim + d];
+                        trainer->network->embeddings[(cand_word_id - 1) * embed_dim + d];
                     distance += delta * delta;
                 }
-                int occurrence = 0, neighbors = 0;
-                double match_score = 0.0;
-                for (size_t e = 0; e < evidence_count; e++) {
-                    if (evidence[e].word_id == candidate_ids[c]) {
-                        occurrence = evidence[e].occurrence_count;
-                        neighbors = evidence[e].neighbor_count;
-                        match_score = evidence[e].match_score;
-                        break;
-                    }
-                }
-                scores[c] = -distance + 0.75 * log(1.0 + occurrence) +
+                int occurrence = evidence[c].occurrence_count;
+                int neighbors = evidence[c].neighbor_count;
+                double match_score = evidence[c].match_score;
+                scores[c] = -distance +
+                    0.75 * log(1.0 + occurrence) +
                     0.50 * log(1.0 + neighbors) +
-                    0.25 * log(1.0 + match_score);
-                if (candidate_ids[c] == target_id) {
-                    found = 1;
-                    target_score = scores[c];
-                }
+                    match_score;
+                if (cand_word_id == target_id) target_score = scores[c];
+            }
+
+            for (size_t c = 0; c < count; c++) {
+                if (candidate_ids[c] == target_id) found = 1;
             }
             if (found) {
+
                 int rank = 0;
                 for (size_t c = 0; c < count; c++) if (scores[c] > target_score) rank++;
                 graph_hits++;
@@ -685,11 +692,37 @@ int main(int argc, char *argv[]) {
                 free_triangles(test_chain);
                 vocab_free(shared_vocab);
             } else {
+                RelationalRegistry *rel_reg = relational_registry_create(shared_vocab->count);
+                if (rel_reg) {
+                    relational_registry_ingest_chain(rel_reg, train_chain);
+                }
+
+                int use_mode_b = 0;
+                for (int arg = 1; arg < argc; arg++) {
+                    if (strcmp(argv[arg], "-mode") == 0 && arg + 1 < argc && strcmp(argv[arg + 1], "B") == 0) {
+                        use_mode_b = 1;
+                        break;
+                    }
+                    if (strcmp(argv[arg], "-modeB") == 0 || strcmp(argv[arg], "--modeB") == 0) {
+                        use_mode_b = 1;
+                        break;
+                    }
+                }
+
                 printf("\n=== Held-out Experiment ===\n");
                 printf("Training triangles: %zu\n", train_chain->count);
                 printf("Held-out triangles: %zu\n", test_chain->count);
                 printf("Shared vocabulary: %zu words\n", shared_vocab->count);
                 printf("Training documents: %d\n", argc - 3);
+
+                if (use_mode_b && rel_reg) {
+                    printf("\n=== Running in Unsupervised Discovery Mode (Mode B) ===\n");
+                    relational_registry_report(rel_reg, shared_vocab, 15);
+                } else {
+                    printf("\n=== Running in Supervised Baseline Mode (Mode A) ===\n");
+                }
+
+
                 BackpropTrainer *trainer = backprop_create(
                     (int)shared_vocab->count, 32, 128, 96, 50, 0.1);
                 if (!trainer || backprop_train_cuda(trainer, train_chain, 2) != 0) {
@@ -697,16 +730,18 @@ int main(int argc, char *argv[]) {
                     backprop_free(trainer);
                 } else {
                     backprop_save_model(trainer, "backprop_model_heldout.bin");
-            ContextGraph *train_graph = context_graph_create(train_chain);
-            evaluate_context_model(trainer, test_chain, train_graph, 100);
-            context_graph_free(train_graph);
+                    ContextGraph *train_graph = context_graph_create(train_chain);
+                    evaluate_context_model(trainer, test_chain, train_graph, rel_reg, use_mode_b, 100);
+                    context_graph_free(train_graph);
                     backprop_free(trainer);
                 }
+                if (rel_reg) relational_registry_free(rel_reg);
                 free_triangles(train_chain);
                 free_triangles(test_chain);
                 vocab_free(shared_vocab);
             }
         }
+
     } else if (argc > 2 && strcmp(argv[2], "-learn") == 0) {
         if (argc < 4) {
             fprintf(stderr, "Error: -learn requires new text/file argument\n");

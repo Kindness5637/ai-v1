@@ -384,3 +384,52 @@ size_t context_graph_collect_candidate_evidence_fallback(const ContextGraph *gra
                                  second_word_id, 0, -1,
                                  1.0, candidates, count, max_candidates);
 }
+
+size_t context_graph_collect_candidate_evidence_relational(const ContextGraph *graph,
+                                                           const RelationalRegistry *rel_reg,
+                                                           int first_word_id,
+                                                           int second_word_id,
+                                                           int rotation,
+                                                           ContextCandidate *candidates,
+                                                           size_t max_candidates) {
+    /* Collect candidates using purely positional & directional evidence without UPOS/DEPREL */
+    size_t count = 0;
+    count = collect_evidence_into(graph, first_word_id, 0, second_word_id, 0, rotation,
+                                  2.0, candidates, count, max_candidates);
+    count = collect_evidence_into(graph, first_word_id, 0, second_word_id, 0, -1,
+                                  1.0, candidates, count, max_candidates);
+
+    if (!rel_reg) return count;
+
+    /* Re-weight candidates using positional asymmetry and transition statistics */
+    for (size_t i = 0; i < count; i++) {
+        int cand_id = candidates[i].word_id;
+        if (cand_id <= 0 || (size_t)cand_id > rel_reg->vocab_size) continue;
+
+        const RelationalWordStats *stats = &rel_reg->word_stats[cand_id];
+        uint64_t support = stats->left_count + stats->right_count + stats->center_count;
+
+        /* Positional compatibility score based on rotation target position */
+        double pos_compat = 0.0;
+        int target_position = (rotation >= 0) ? (rotation + 2) % 3 : 2;
+        if (target_position == 0) {
+            pos_compat = (stats->total_count > 0) ? (double)stats->left_count / stats->total_count : 0.0;
+        } else if (target_position == 1) {
+            pos_compat = (stats->total_count > 0) ? (double)stats->center_count / stats->total_count : 0.0;
+        } else {
+            pos_compat = (stats->total_count > 0) ? (double)stats->right_count / stats->total_count : 0.0;
+        }
+
+        /* Transition compatibility with preceding word */
+        uint64_t trans_count = relational_registry_get_transition_count(
+            rel_reg, second_word_id, cand_id, (target_position == 2) ? 1 : 0);
+
+        double transition_compat = (trans_count > 0) ? log1p((double)trans_count) : 0.0;
+        double support_weight = log1p((double)support);
+
+        candidates[i].match_score += pos_compat * 2.0 + transition_compat * 1.5 + support_weight * 0.5;
+    }
+
+    return count;
+}
+

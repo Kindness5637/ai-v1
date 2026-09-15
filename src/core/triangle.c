@@ -394,3 +394,164 @@ void print_registry(const TriangleChain *chain) {
     if (!chain || !chain->registry) return;
     registry_print(chain->registry);
 }
+
+RelationalRegistry *relational_registry_create(size_t initial_vocab_size) {
+    RelationalRegistry *reg = calloc(1, sizeof(RelationalRegistry));
+    if (!reg) return NULL;
+    if (initial_vocab_size > 0) {
+        relational_registry_ensure_vocab(reg, initial_vocab_size);
+    }
+    reg->transition_capacity = 256;
+    reg->transitions = malloc(reg->transition_capacity * sizeof(RelationalTransition));
+    if (!reg->transitions) {
+        free(reg->word_stats);
+        free(reg);
+        return NULL;
+    }
+    return reg;
+}
+
+void relational_registry_free(RelationalRegistry *reg) {
+    if (!reg) return;
+    free(reg->word_stats);
+    free(reg->transitions);
+    free(reg);
+}
+
+void relational_registry_ensure_vocab(RelationalRegistry *reg, size_t vocab_size) {
+    if (!reg || vocab_size <= reg->vocab_size) return;
+    RelationalWordStats *new_stats = realloc(reg->word_stats, (vocab_size + 1) * sizeof(RelationalWordStats));
+    if (!new_stats) return;
+    memset(new_stats + reg->vocab_size + 1, 0, (vocab_size - reg->vocab_size) * sizeof(RelationalWordStats));
+    reg->word_stats = new_stats;
+    reg->vocab_size = vocab_size;
+}
+
+static void record_transition(RelationalRegistry *reg, int from_id, int to_id, int transition_type) {
+    if (!reg || from_id <= 0 || to_id <= 0) return;
+    for (size_t i = 0; i < reg->transition_count; i++) {
+        if (reg->transitions[i].from_word_id == from_id &&
+            reg->transitions[i].to_word_id == to_id &&
+            reg->transitions[i].transition_type == transition_type) {
+            reg->transitions[i].count++;
+            return;
+        }
+    }
+    if (reg->transition_count >= reg->transition_capacity) {
+        size_t new_cap = reg->transition_capacity * 2;
+        RelationalTransition *new_tr = realloc(reg->transitions, new_cap * sizeof(RelationalTransition));
+        if (!new_tr) return;
+        reg->transitions = new_tr;
+        reg->transition_capacity = new_cap;
+    }
+    reg->transitions[reg->transition_count++] = (RelationalTransition){
+        .from_word_id = from_id,
+        .to_word_id = to_id,
+        .transition_type = transition_type,
+        .count = 1
+    };
+}
+
+void relational_registry_ingest_chain(RelationalRegistry *reg, const TriangleChain *chain) {
+    if (!reg || !chain || !chain->vocab) return;
+    relational_registry_ensure_vocab(reg, chain->vocab->count);
+
+    for (size_t i = 0; i < chain->count; i++) {
+        const Triangle *t = &chain->triangles[i];
+        int w0 = t->word_ids[0];
+        int w1 = t->word_ids[1];
+        int w2 = t->word_ids[2];
+
+        /* Forward pass observations */
+        if (w0 > 0 && (size_t)w0 <= reg->vocab_size) {
+            reg->word_stats[w0].left_count++;
+            reg->word_stats[w0].total_count++;
+        }
+        if (w1 > 0 && (size_t)w1 <= reg->vocab_size) {
+            reg->word_stats[w1].center_count++;
+            reg->word_stats[w1].total_count++;
+        }
+        if (w2 > 0 && (size_t)w2 <= reg->vocab_size) {
+            reg->word_stats[w2].right_count++;
+            reg->word_stats[w2].total_count++;
+        }
+
+        /* Forward transitions */
+        record_transition(reg, w0, w1, 0); /* L -> C */
+        record_transition(reg, w1, w2, 1); /* C -> R */
+
+        /* Backward pass observations */
+        if (w2 > 0 && (size_t)w2 <= reg->vocab_size) {
+            reg->word_stats[w2].left_count++;
+            reg->word_stats[w2].total_count++;
+        }
+        if (w1 > 0 && (size_t)w1 <= reg->vocab_size) {
+            reg->word_stats[w1].center_count++;
+            reg->word_stats[w1].total_count++;
+        }
+        if (w0 > 0 && (size_t)w0 <= reg->vocab_size) {
+            reg->word_stats[w0].right_count++;
+            reg->word_stats[w0].total_count++;
+        }
+
+        /* Backward transitions */
+        record_transition(reg, w2, w1, 2); /* R -> C */
+        record_transition(reg, w1, w0, 3); /* C -> L */
+    }
+
+    /* Update asymmetry scores */
+    for (size_t w = 1; w <= reg->vocab_size; w++) {
+        uint64_t L = reg->word_stats[w].left_count;
+        uint64_t R = reg->word_stats[w].right_count;
+        if (L + R == 0) {
+            reg->word_stats[w].asymmetry = 0.0;
+        } else {
+            reg->word_stats[w].asymmetry = (double)((int64_t)L - (int64_t)R) / (double)(L + R);
+        }
+    }
+}
+
+uint64_t relational_registry_get_transition_count(const RelationalRegistry *reg,
+                                                  int from_id, int to_id,
+                                                  int transition_type) {
+    if (!reg) return 0;
+    for (size_t i = 0; i < reg->transition_count; i++) {
+        if (reg->transitions[i].from_word_id == from_id &&
+            reg->transitions[i].to_word_id == to_id &&
+            reg->transitions[i].transition_type == transition_type) {
+            return reg->transitions[i].count;
+        }
+    }
+    return 0;
+}
+
+void relational_registry_report(const RelationalRegistry *reg, const Vocabulary *vocab, size_t top_n) {
+    if (!reg || !vocab) return;
+
+    printf("\n=== DISCOVERED STRUCTURAL PATTERN HYPOTHESES (Unsupervised Mode B) ===\n");
+    printf("%-5s %-15s %-10s %-8s %-8s %-8s %-10s\n",
+           "ID", "Word", "Support", "Left", "Center", "Right", "Asymmetry");
+    printf("-------------------------------------------------------------------------\n");
+
+    size_t printed = 0;
+    for (size_t w = 1; w <= reg->vocab_size && printed < top_n; w++) {
+        uint64_t L = reg->word_stats[w].left_count;
+        uint64_t R = reg->word_stats[w].right_count;
+        uint64_t C = reg->word_stats[w].center_count;
+        uint64_t support = L + R + C;
+
+        if (support < 5) continue; /* Minimum evidence threshold for hypothesis reporting */
+
+        const char *word_text = vocab_get_word(vocab, (int)w);
+        printf("%-5d %-15s %-10glu %-8glu %-8glu %-8glu %-+10.3f\n",
+               (int)w, word_text ? word_text : "?",
+               (unsigned long long)support,
+               (unsigned long long)L,
+               (unsigned long long)C,
+               (unsigned long long)R,
+               reg->word_stats[w].asymmetry);
+        printed++;
+    }
+    printf("================================================================---------\n");
+}
+

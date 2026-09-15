@@ -84,5 +84,13 @@ size_t context_graph_collect_candidate_evidence_fallback(const ContextGraph *gra
                                                          int rotation,
                                                          ContextCandidate *candidates,
                                                          size_t max_candidates);
+size_t context_graph_collect_candidate_evidence_relational(const ContextGraph *graph,
+                                                           const RelationalRegistry *rel_reg,
+                                                           int first_word_id,
+                                                           int second_word_id,
+                                                           int rotation,
+                                                           ContextCandidate *candidates,
+                                                           size_t max_candidates);
 
 #endif
+
