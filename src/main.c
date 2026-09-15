@@ -159,10 +159,14 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                 int occurrence = evidence[c].occurrence_count;
                 int neighbors = evidence[c].neighbor_count;
                 double match_score = evidence[c].match_score;
-                scores[c] = -distance +
+                double base_score = -distance +
                     0.75 * log(1.0 + occurrence) +
-                    0.50 * log(1.0 + neighbors) +
-                    match_score;
+                    0.50 * log(1.0 + neighbors);
+                if (use_mode_b) {
+                    scores[c] = base_score * (0.5 + match_score);
+                } else {
+                    scores[c] = base_score + match_score;
+                }
                 if (cand_word_id == target_id) target_score = scores[c];
             }
 
@@ -731,10 +735,13 @@ int main(int argc, char *argv[]) {
 
                 BackpropTrainer *trainer = backprop_create(
                     (int)shared_vocab->count, 32, 128, 96, 50, 0.1);
-                if (!trainer || backprop_train_cuda(trainer, train_chain, 2) != 0) {
-                    fprintf(stderr, "Held-out CUDA training failed\n");
-                    backprop_free(trainer);
+                if (!trainer) {
+                    fprintf(stderr, "Failed to create backprop trainer\n");
                 } else {
+                    if (backprop_train_cuda(trainer, train_chain, 2) != 0) {
+                        printf("CUDA training unavailable or failed. Falling back to CPU backprop_train...\n");
+                        backprop_train(trainer, train_chain);
+                    }
                     backprop_save_model(trainer, "backprop_model_heldout.bin");
                     ContextGraph *train_graph = context_graph_create(train_chain);
                     evaluate_context_model(trainer, test_chain, train_graph, rel_reg, use_mode_b, 100);

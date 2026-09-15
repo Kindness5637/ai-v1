@@ -403,33 +403,48 @@ size_t context_graph_collect_candidate_evidence_relational(const ContextGraph *g
 
     if (!rel_reg) return count;
 
-    /* Re-weight candidates using positional asymmetry and transition statistics */
+    /* Re-weight candidates using bounded relational evidence.
+     * All components are bounded to [0,1]:
+     *   pos_ratio          ∈ [0,1]  — how often candidate occupies target position
+     *   transition_compat  ∈ [0,1]  — squashed transition evidence
+     *   relational_compat  ∈ [0,1]  — final gated score
+     */
     for (size_t i = 0; i < count; i++) {
         int cand_id = candidates[i].word_id;
         if (cand_id <= 0 || (size_t)cand_id > rel_reg->vocab_size) continue;
 
         const RelationalWordStats *stats = &rel_reg->word_stats[cand_id];
-        uint64_t support = stats->left_count + stats->right_count + stats->center_count;
+        double total = (double)(stats->left_count +
+                                stats->center_count +
+                                stats->right_count);
 
-        /* Positional compatibility score based on rotation target position */
-        double pos_compat = 0.0;
+        /* Positional ratio: fraction of times candidate occupies the target position */
+        double pos_ratio = 0.0;
         int target_position = (rotation >= 0) ? (rotation + 2) % 3 : 2;
-        if (target_position == 0) {
-            pos_compat = (stats->total_count > 0) ? (double)stats->left_count / stats->total_count : 0.0;
-        } else if (target_position == 1) {
-            pos_compat = (stats->total_count > 0) ? (double)stats->center_count / stats->total_count : 0.0;
-        } else {
-            pos_compat = (stats->total_count > 0) ? (double)stats->right_count / stats->total_count : 0.0;
+        if (total > 0.0) {
+            if (target_position == 0)
+                pos_ratio = (double)stats->left_count / total;
+            else if (target_position == 1)
+                pos_ratio = (double)stats->center_count / total;
+            else
+                pos_ratio = (double)stats->right_count / total;
         }
 
-        /* Transition compatibility with preceding word */
-        uint64_t trans_count = relational_registry_get_transition_count(
+        /* Forward transition: second_word → candidate in the target direction */
+        uint64_t fwd = relational_registry_get_transition_count(
             rel_reg, second_word_id, cand_id, (target_position == 2) ? 1 : 0);
 
-        double transition_compat = (trans_count > 0) ? log1p((double)trans_count) : 0.0;
-        double support_weight = log1p((double)support);
+        /* Backward transition: candidate → second_word in the reverse direction */
+        uint64_t bwd = relational_registry_get_transition_count(
+            rel_reg, cand_id, second_word_id, (target_position == 2) ? 2 : 3);
 
-        candidates[i].match_score += pos_compat * 2.0 + transition_compat * 1.5 + support_weight * 0.5;
+        double transition_strength = log1p((double)(fwd + bwd));
+        double transition_compat = transition_strength / (1.0 + transition_strength);
+
+        /* Gate positional ratio by transition evidence, bounded [0,1] */
+        double relational_compat = pos_ratio * (0.5 + 0.5 * transition_compat);
+
+        candidates[i].match_score = relational_compat;
     }
 
     return count;
