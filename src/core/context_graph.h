@@ -44,6 +44,7 @@ typedef struct {
     int word_id;
     int occurrence_count;
     int neighbor_count;
+    double match_score;
 } ContextCandidate;
 
 ContextGraph *context_graph_create(const TriangleChain *chain);
@@ -61,6 +62,12 @@ size_t context_graph_collect_candidates_scoped(const ContextGraph *graph,
                                                int rotation,
                                                int *candidate_ids,
                                                size_t max_candidates);
+size_t context_graph_collect_candidates_fallback(const ContextGraph *graph,
+                                                 int first_word_id, int first_role_id,
+                                                 int second_word_id, int second_role_id,
+                                                 int rotation,
+                                                 int *candidate_ids,
+                                                 size_t max_candidates);
 size_t context_graph_collect_candidate_evidence(const ContextGraph *graph,
                                                 int first_word_id, int second_word_id,
                                                 ContextCandidate *candidates,
@@ -71,5 +78,11 @@ size_t context_graph_collect_candidate_evidence_scoped(const ContextGraph *graph
                                                        int rotation,
                                                        ContextCandidate *candidates,
                                                        size_t max_candidates);
+size_t context_graph_collect_candidate_evidence_fallback(const ContextGraph *graph,
+                                                         int first_word_id, int first_role_id,
+                                                         int second_word_id, int second_role_id,
+                                                         int rotation,
+                                                         ContextCandidate *candidates,
+                                                         size_t max_candidates);
 
 #endif

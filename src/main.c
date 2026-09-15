@@ -119,7 +119,7 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
             int first_role = chain->triangles[t].role_ids[rotation];
             int second_role = chain->triangles[t].role_ids[(rotation + 1) % 3];
-            size_t count = context_graph_collect_candidates_scoped(
+            size_t count = context_graph_collect_candidates_fallback(
                 graph, first_id, first_role, second_id, second_role, rotation,
                 candidate_ids, 256);
             total++;
@@ -129,7 +129,7 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             if (count > 1) ambiguous_pairs++;
             if ((int)count > max_candidates) max_candidates = (int)count;
             ContextCandidate evidence[256];
-            size_t evidence_count = context_graph_collect_candidate_evidence_scoped(
+            size_t evidence_count = context_graph_collect_candidate_evidence_fallback(
                 graph, first_id, first_role, second_id, second_role, rotation,
                 evidence, 256);
             fill_model_input(input, 0, first_id, first_role, trainer->network);
@@ -146,15 +146,18 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                     distance += delta * delta;
                 }
                 int occurrence = 0, neighbors = 0;
+                double match_score = 0.0;
                 for (size_t e = 0; e < evidence_count; e++) {
                     if (evidence[e].word_id == candidate_ids[c]) {
                         occurrence = evidence[e].occurrence_count;
                         neighbors = evidence[e].neighbor_count;
+                        match_score = evidence[e].match_score;
                         break;
                     }
                 }
                 scores[c] = -distance + 0.75 * log(1.0 + occurrence) +
-                    0.50 * log(1.0 + neighbors);
+                    0.50 * log(1.0 + neighbors) +
+                    0.25 * log(1.0 + match_score);
                 if (candidate_ids[c] == target_id) {
                     found = 1;
                     target_score = scores[c];
