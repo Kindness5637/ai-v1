@@ -269,6 +269,62 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                    pair_queries - graph_hits, 100.0 * (pair_queries - graph_hits) / pair_queries);
             printf("  └─ Unseen Context Pair Queries (Uncovered): %d (%.1f%%)\n",
                    total - pair_queries, 100.0 * (total - pair_queries) / total);
+
+            /* Diagnostic Provenance Audit for the 106 Covered Misses */
+            int gold_seen_in_train_count = 0;
+            int gold_never_seen_in_train_count = 0;
+            int gold_truncated_by_max_count = 0;
+
+            for (size_t t = 0; t < limit; t++) {
+                for (int rotation = 0; rotation < 3; rotation++) {
+                    int first_id = chain->triangles[t].word_ids[rotation];
+                    int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+                    int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+
+                    ContextCandidate evidence[256];
+                    size_t count = context_graph_collect_candidate_evidence_relational(
+                        graph, rel_reg, first_id, second_id, rotation, evidence, 256);
+                    if (count == 0) continue;
+
+                    int in_candidates = 0;
+                    for (size_t c = 0; c < count; c++) {
+                        if (evidence[c].word_id == target_id) { in_candidates = 1; break; }
+                    }
+
+                    if (!in_candidates) {
+                        /* Check if (first_id, second_id, target_id) actually exists anywhere in graph nodes */
+                        int seen_in_graph_nodes = 0;
+                        for (size_t i = 0; i < graph->node_count; i++) {
+                            const ContextNode *node = &graph->nodes[i];
+                            if (node->type == CONTEXT_TRIANGLE_NODE &&
+                                node->word_ids[0] == first_id &&
+                                node->word_ids[1] == second_id &&
+                                node->rotation == rotation) {
+                                if (node->word_ids[2] == target_id) {
+                                    seen_in_graph_nodes = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        if (seen_in_graph_nodes) {
+                            gold_seen_in_train_count++;
+                            if (count >= 256) gold_truncated_by_max_count++;
+                        } else {
+                            gold_never_seen_in_train_count++;
+                        }
+                    }
+                }
+            }
+
+            printf("\n--- Breakdown of the %d Known-Context Misses ---\n", pair_queries - graph_hits);
+            printf("  ├─ Gold Target ACTUALLY in Training Graph (Information Loss / Truncation): %d\n",
+                   gold_seen_in_train_count);
+            if (gold_seen_in_train_count > 0) {
+                printf("  │   └─ Of which were truncated by candidate capacity cap (256): %d\n",
+                       gold_truncated_by_max_count);
+            }
+            printf("  └─ Gold Target NEVER seen with this exact pair in Training (Generalization gap): %d\n",
+                   gold_never_seen_in_train_count);
             printf("=========================================================\n");
         }
     }
