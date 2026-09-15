@@ -653,7 +653,9 @@ int main(int argc, char *argv[]) {
                 combined_train[train_size] = '\0';
             }
             for (int arg = 4; combined_train && arg < argc; arg++) {
+                if (argv[arg][0] == '-') continue; /* Skip flags like -mode or -modeB */
                 char *extra_content = read_file(argv[arg]);
+
                 if (!extra_content) {
                     fprintf(stderr, "Unable to read additional training file: %s\n", argv[arg]);
                     free(combined_train);

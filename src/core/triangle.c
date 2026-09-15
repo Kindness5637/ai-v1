@@ -543,7 +543,8 @@ void relational_registry_report(const RelationalRegistry *reg, const Vocabulary 
         if (support < 5) continue; /* Minimum evidence threshold for hypothesis reporting */
 
         const char *word_text = vocab_get_word(vocab, (int)w);
-        printf("%-5d %-15s %-10glu %-8glu %-8glu %-8glu %-+10.3f\n",
+        printf("%-5d %-15s %-10llu %-8llu %-8llu %-8llu %-+10.3f\n",
+
                (int)w, word_text ? word_text : "?",
                (unsigned long long)support,
                (unsigned long long)L,

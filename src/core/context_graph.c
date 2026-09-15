@@ -1,6 +1,8 @@
 #include "context_graph.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
+
 
 static uint64_t signature_for(const int words[3], int rotation) {
     uint64_t hash = 1469598103934665603ULL;
