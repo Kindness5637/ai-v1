@@ -326,6 +326,56 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             printf("  └─ Gold Target NEVER seen with this exact pair in Training (Generalization gap): %d\n",
                    gold_never_seen_in_train_count);
             printf("=========================================================\n");
+
+            if (gold_seen_in_train_count > 0) {
+                printf("\n=== Experiment A: Detailed Trace of the %d Confirmed Information-Loss Queries ===\n",
+                       gold_seen_in_train_count);
+                printf("%-5s %-15s %-15s %-15s %-10s %-12s\n",
+                       "Rot", "Word1 (W0)", "Word2 (W1)", "Gold (W2)", "CandCount", "Reason");
+                printf("-------------------------------------------------------------------------------\n");
+                for (size_t t = 0; t < limit; t++) {
+                    for (int rotation = 0; rotation < 3; rotation++) {
+                        int first_id = chain->triangles[t].word_ids[rotation];
+                        int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+                        int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+
+                        ContextCandidate evidence[256];
+                        size_t count = context_graph_collect_candidate_evidence_relational(
+                            graph, rel_reg, first_id, second_id, rotation, evidence, 256);
+                        if (count == 0) continue;
+
+                        int in_candidates = 0;
+                        for (size_t c = 0; c < count; c++) {
+                            if (evidence[c].word_id == target_id) { in_candidates = 1; break; }
+                        }
+
+                        if (!in_candidates) {
+                            int seen_in_graph = 0;
+                            for (size_t i = 0; i < graph->node_count; i++) {
+                                const ContextNode *node = &graph->nodes[i];
+                                if (node->type == CONTEXT_TRIANGLE_NODE &&
+                                    node->word_ids[0] == first_id &&
+                                    node->word_ids[1] == second_id &&
+                                    node->rotation == rotation &&
+                                    node->word_ids[2] == target_id) {
+                                    seen_in_graph = 1;
+                                    break;
+                                }
+                            }
+                            if (seen_in_graph) {
+                                const char *w1 = vocab_get_word(chain->vocab, first_id);
+                                const char *w2 = vocab_get_word(chain->vocab, second_id);
+                                const char *gold = vocab_get_word(chain->vocab, target_id);
+                                const char *reason = (count >= 256) ? "256 Cap Truncation" : "Traversal/Scoping Miss";
+                                printf("%-5d %-15s %-15s %-15s %-10zu %-12s\n",
+                                       rotation, w1 ? w1 : "?", w2 ? w2 : "?", gold ? gold : "?",
+                                       count, reason);
+                            }
+                        }
+                    }
+                }
+                printf("================================================-------------------------------\n");
+            }
         }
     }
     free(input);
