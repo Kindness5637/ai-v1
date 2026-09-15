@@ -15,10 +15,7 @@ static uint64_t signature_for(const int words[3], int rotation) {
 
 static int add_bond(ContextGraph *graph, int from, int to, double weight,
                     ContextBondType type) {
-    ContextBond *grown = realloc(graph->bonds,
-                                 (graph->bond_count + 1) * sizeof(ContextBond));
-    if (!grown) return 0;
-    graph->bonds = grown;
+    if (!graph || graph->bond_count >= graph->bond_capacity) return 0;
     graph->bonds[graph->bond_count++] = (ContextBond){from, to, weight, type};
     return 1;
 }
@@ -34,6 +31,19 @@ ContextGraph *context_graph_create(const TriangleChain *chain) {
     graph->nodes = calloc(graph->node_count, sizeof(ContextNode));
     if (!graph->nodes) {
         free(graph);
+        return NULL;
+    }
+
+    /* Each triangle rotation has three occurrence bonds and one rotation
+     * bond. Every rotation except those in the final triangle also has one
+     * neighbor bond. Allocate the complete bond array once; reallocating for
+     * every bond made large held-out runs spend most of their time in the
+     * allocator. */
+    graph->bond_capacity = context_count * 4 +
+                          (chain->count > 0 ? (chain->count - 1) * 3 : 0);
+    graph->bonds = calloc(graph->bond_capacity, sizeof(ContextBond));
+    if (!graph->bonds) {
+        context_graph_free(graph);
         return NULL;
     }
 
@@ -464,4 +474,3 @@ size_t context_graph_collect_candidate_evidence_relational(const ContextGraph *g
 
     return count;
 }
-

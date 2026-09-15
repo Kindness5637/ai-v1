@@ -38,6 +38,7 @@ typedef struct {
     size_t node_count;
     ContextBond *bonds;
     size_t bond_count;
+    size_t bond_capacity;
 } ContextGraph;
 
 typedef struct {
@@ -93,4 +94,3 @@ size_t context_graph_collect_candidate_evidence_relational(const ContextGraph *g
                                                            size_t max_candidates);
 
 #endif
-

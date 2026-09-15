@@ -14,6 +14,7 @@
 #include "core/learn.h"
 #include "core/punctuation.h"
 #include "core/backprop.h"
+#include "core/eval_cuda.h"
 
 char *read_file(const char *filename) {
     FILE *file = fopen(filename, "r");
@@ -94,6 +95,74 @@ static void fill_model_input(double *input, int slot, int word_id, int role_id,
 static int has_conllu_suffix(const char *filename) {
     size_t length = strlen(filename);
     return length >= 7 && strcmp(filename + length - 7, ".conllu") == 0;
+}
+
+static uint64_t threshold_transition_count(const RelationalRegistry *rel_reg,
+                                           const ThresholdSweepQuery *query,
+                                           int candidate_id) {
+    int target_position = query->target_position;
+    uint64_t forward = 0;
+    uint64_t backward = 0;
+    if (target_position == 2) {
+        forward = relational_registry_get_transition_count(
+            rel_reg, query->second_id, candidate_id, 1);
+        backward = relational_registry_get_transition_count(
+            rel_reg, candidate_id, query->second_id, 2);
+    } else if (target_position == 0) {
+        forward = relational_registry_get_transition_count(
+            rel_reg, candidate_id, query->first_id, 0);
+        backward = relational_registry_get_transition_count(
+            rel_reg, query->first_id, candidate_id, 3);
+    } else {
+        forward = relational_registry_get_transition_count(
+            rel_reg, query->second_id, candidate_id, 0);
+        backward = relational_registry_get_transition_count(
+            rel_reg, candidate_id, query->second_id, 3);
+    }
+    return forward + backward;
+}
+
+static void run_threshold_sweep_cpu(const ThresholdSweepQuery *queries,
+                                    size_t query_count,
+                                    const RelationalRegistry *rel_reg,
+                                    const double *position_thresholds,
+                                    size_t position_threshold_count,
+                                    const uint64_t *transition_thresholds,
+                                    size_t transition_threshold_count,
+                                    ThresholdSweepResult *results) {
+    size_t config_count = position_threshold_count * transition_threshold_count;
+    memset(results, 0, config_count * sizeof(*results));
+    for (size_t q = 0; q < query_count; q++) {
+        const ThresholdSweepQuery *query = &queries[q];
+        for (size_t p = 0; p < position_threshold_count; p++) {
+            for (size_t tr = 0; tr < transition_threshold_count; tr++) {
+                size_t index = p * transition_threshold_count + tr;
+                for (size_t word = 1; word <= rel_reg->vocab_size; word++) {
+                    const RelationalWordStats *stats = &rel_reg->word_stats[word];
+                    double total = (double)(stats->left_count + stats->center_count + stats->right_count);
+                    if (total <= 0.0) continue;
+                    uint64_t position_count = query->target_position == 0 ? stats->left_count :
+                                               query->target_position == 1 ? stats->center_count :
+                                                                            stats->right_count;
+                    if ((double)position_count / total < position_thresholds[p]) continue;
+                    if (threshold_transition_count(rel_reg, query, (int)word) < transition_thresholds[tr]) continue;
+                    results[index].candidates_emitted++;
+                    if ((int)word == query->target_id) {
+                        results[index].gold_recovered++;
+                        const RelationalWordStats *target = &rel_reg->word_stats[query->target_id];
+                        double target_total = (double)(target->left_count + target->center_count + target->right_count);
+                        uint64_t target_position_count = query->target_position == 0 ? target->left_count :
+                                                         query->target_position == 1 ? target->center_count :
+                                                                                      target->right_count;
+                        if (target_total > 0.0 &&
+                            (double)target_position_count / target_total >= 0.15 &&
+                            threshold_transition_count(rel_reg, query, query->target_id) > 0)
+                            results[index].fully_supported_recovered++;
+                    }
+                }
+            }
+        }
+    }
 }
 
 static void evaluate_context_model(BackpropTrainer *trainer,
@@ -539,125 +608,91 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                 double pos_ths[3] = {0.15, 0.25, 0.35};
                 uint64_t trans_ths[4] = {1, 2, 3, 6}; /* >0, >1, >2, >5 */
 
+                /* Build the exact same fallback-query set used by the
+                 * original CPU sweep. Only these misses need vocabulary-wide
+                 * generation; all other queries are already represented by
+                 * graph candidates. */
+                size_t query_capacity = limit * 3;
+                ThresholdSweepQuery *sweep_queries = calloc(
+                    query_capacity ? query_capacity : 1, sizeof(*sweep_queries));
+                size_t sweep_query_count = 0;
+                if (sweep_queries) {
+                    for (size_t t = 0; t < limit; t++) {
+                        for (int rotation = 0; rotation < 3; rotation++) {
+                            int first_id = chain->triangles[t].word_ids[rotation];
+                            int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+                            int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+                            if (target_id <= 0) continue;
+
+                            ContextCandidate evidence[256];
+                            size_t count = context_graph_collect_candidate_evidence_relational(
+                                graph, rel_reg, first_id, second_id, rotation, evidence, 256);
+                            if (count == 0) continue;
+
+                            int in_candidates = 0;
+                            for (size_t c = 0; c < count; c++) {
+                                if (evidence[c].word_id == target_id) {
+                                    in_candidates = 1;
+                                    break;
+                                }
+                            }
+                            if (in_candidates) continue;
+
+                            int seen_in_graph = 0;
+                            for (size_t i = 0; i < graph->node_count; i++) {
+                                const ContextNode *node = &graph->nodes[i];
+                                if (node->type == CONTEXT_TRIANGLE_NODE &&
+                                    node->word_ids[0] == first_id &&
+                                    node->word_ids[1] == second_id &&
+                                    node->rotation == rotation &&
+                                    node->word_ids[2] == target_id) {
+                                    seen_in_graph = 1;
+                                    break;
+                                }
+                            }
+                            if (!seen_in_graph && (size_t)target_id <= rel_reg->vocab_size &&
+                                sweep_query_count < query_capacity) {
+                                sweep_queries[sweep_query_count++] = (ThresholdSweepQuery){
+                                    first_id, second_id, target_id, (rotation + 2) % 3};
+                            }
+                        }
+                    }
+                }
+
                 printf("\n=== 2D Threshold Sweep: Candidate Reduction vs Gold Recovery (81 Misses) ===\n");
                 printf("%-10s %-12s %-20s %-20s %-15s\n", "Pos Thresh", "Trans Cutoff", "Gold Recovered", "Fully-Supp (33)", "Avg Candidates");
                 printf("-----------------------------------------------------------------------------------------\n");
 
+                ThresholdSweepResult sweep_results[12];
+                int sweep_gpu = sweep_query_count > 0 &&
+                    run_threshold_sweep_cuda(
+                        sweep_queries, sweep_query_count, rel_reg->vocab_size,
+                        rel_reg->word_stats, rel_reg->transitions,
+                        rel_reg->transition_count, pos_ths, 3, trans_ths, 4,
+                        sweep_results) == 0;
+                if (!sweep_gpu) {
+                    run_threshold_sweep_cpu(
+                        sweep_queries, sweep_query_count, rel_reg, pos_ths, 3,
+                        trans_ths, 4, sweep_results);
+                    printf("[Threshold sweep: CPU fallback]\n");
+                } else {
+                    printf("[Threshold sweep: CUDA]\n");
+                }
                 for (int p_idx = 0; p_idx < 3; p_idx++) {
                     for (int t_idx = 0; t_idx < 4; t_idx++) {
-                        double p_th = pos_ths[p_idx];
-                        uint64_t tr_th = trans_ths[t_idx];
-
-                        int sweep_gold_rec = 0;
-                        int sweep_fs_rec = 0;
-                        size_t sweep_cand_emitted = 0;
-
-                        for (size_t t = 0; t < limit; t++) {
-                            for (int rotation = 0; rotation < 3; rotation++) {
-                                int first_id = chain->triangles[t].word_ids[rotation];
-                                int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
-                                int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
-                                if (target_id <= 0) continue;
-
-                                ContextCandidate evidence[256];
-                                size_t count = context_graph_collect_candidate_evidence_relational(
-                                    graph, rel_reg, first_id, second_id, rotation, evidence, 256);
-                                if (count == 0) continue;
-
-                                int in_candidates = 0;
-                                for (size_t c = 0; c < count; c++) {
-                                    if (evidence[c].word_id == target_id) { in_candidates = 1; break; }
-                                }
-
-                                if (!in_candidates) {
-                                    int seen_in_graph = 0;
-                                    for (size_t i = 0; i < graph->node_count; i++) {
-                                        const ContextNode *node = &graph->nodes[i];
-                                        if (node->type == CONTEXT_TRIANGLE_NODE &&
-                                            node->word_ids[0] == first_id &&
-                                            node->word_ids[1] == second_id &&
-                                            node->rotation == rotation &&
-                                            node->word_ids[2] == target_id) {
-                                            seen_in_graph = 1;
-                                            break;
-                                        }
-                                    }
-                                    if (!seen_in_graph && target_id > 0 && (size_t)target_id <= rel_reg->vocab_size) {
-                                        int target_position = (rotation >= 0) ? (rotation + 2) % 3 : 2;
-                                        size_t generated_count = 0;
-                                        int gold_in_generated = 0;
-
-                                        for (size_t w = 1; w <= rel_reg->vocab_size; w++) {
-                                            const RelationalWordStats *w_stats = &rel_reg->word_stats[w];
-                                            double total_w = (double)(w_stats->left_count + w_stats->center_count + w_stats->right_count);
-                                            if (total_w <= 0.0) continue;
-
-                                            double pos_ratio = 0.0;
-                                            if (target_position == 0) pos_ratio = (double)w_stats->left_count / total_w;
-                                            else if (target_position == 1) pos_ratio = (double)w_stats->center_count / total_w;
-                                            else pos_ratio = (double)w_stats->right_count / total_w;
-
-                                            if (pos_ratio < p_th) continue;
-
-                                            uint64_t fwd = 0, bwd = 0;
-                                            if (target_position == 2) {
-                                                fwd = relational_registry_get_transition_count(rel_reg, second_id, (int)w, 1);
-                                                bwd = relational_registry_get_transition_count(rel_reg, (int)w, second_id, 2);
-                                            } else if (target_position == 0) {
-                                                fwd = relational_registry_get_transition_count(rel_reg, (int)w, first_id, 0);
-                                                bwd = relational_registry_get_transition_count(rel_reg, first_id, (int)w, 3);
-                                            } else if (target_position == 1) {
-                                                fwd = relational_registry_get_transition_count(rel_reg, second_id, (int)w, 0);
-                                                bwd = relational_registry_get_transition_count(rel_reg, (int)w, second_id, 3);
-                                            }
-
-                                            if (fwd + bwd >= tr_th) {
-                                                generated_count++;
-                                                if ((int)w == target_id) gold_in_generated = 1;
-                                            }
-                                        }
-
-                                        sweep_cand_emitted += generated_count;
-                                        if (gold_in_generated) {
-                                            sweep_gold_rec++;
-
-                                            const RelationalWordStats *g_stats = &rel_reg->word_stats[target_id];
-                                            double g_total = (double)(g_stats->left_count + g_stats->center_count + g_stats->right_count);
-                                            double g_pos = 0.0;
-                                            if (g_total > 0.0) {
-                                                if (target_position == 0) g_pos = (double)g_stats->left_count / g_total;
-                                                else if (target_position == 1) g_pos = (double)g_stats->center_count / g_total;
-                                                else g_pos = (double)g_stats->right_count / g_total;
-                                            }
-                                            uint64_t g_fwd = 0, g_bwd = 0;
-                                            if (target_position == 2) {
-                                                g_fwd = relational_registry_get_transition_count(rel_reg, second_id, target_id, 1);
-                                                g_bwd = relational_registry_get_transition_count(rel_reg, target_id, second_id, 2);
-                                            } else if (target_position == 0) {
-                                                g_fwd = relational_registry_get_transition_count(rel_reg, target_id, first_id, 0);
-                                                g_bwd = relational_registry_get_transition_count(rel_reg, first_id, target_id, 3);
-                                            } else if (target_position == 1) {
-                                                g_fwd = relational_registry_get_transition_count(rel_reg, second_id, target_id, 0);
-                                                g_bwd = relational_registry_get_transition_count(rel_reg, target_id, second_id, 3);
-                                            }
-
-                                            if (g_pos >= 0.15 && (g_fwd + g_bwd > 0)) sweep_fs_rec++;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
+                        int index = p_idx * 4 + t_idx;
                         char cutoff_str[16];
-                        snprintf(cutoff_str, sizeof(cutoff_str), ">= %llu", (unsigned long long)tr_th);
-                        printf("%-10.2f %-12s %d / 81 (%.1f%%)   %d / 33 (%.1f%%)   %.2f\n",
-                               p_th, cutoff_str,
-                               sweep_gold_rec, gen_total_meaningful > 0 ? 100.0 * sweep_gold_rec / gen_total_meaningful : 0.0,
-                               sweep_fs_rec, 33.0 > 0.0 ? 100.0 * sweep_fs_rec / 33.0 : 0.0,
-                               gen_total_meaningful > 0 ? (double)sweep_cand_emitted / gen_total_meaningful : 0.0);
-                    }
+                        snprintf(cutoff_str, sizeof(cutoff_str), ">= %llu", (unsigned long long)trans_ths[t_idx]);
+                        printf("%-10.2f %-12s %llu / 81 (%.1f%%)   %llu / 33 (%.1f%%)   %.2f\n",
+                               pos_ths[p_idx], cutoff_str,
+                               (unsigned long long)sweep_results[index].gold_recovered,
+                               gen_total_meaningful > 0 ? 100.0 * sweep_results[index].gold_recovered / gen_total_meaningful : 0.0,
+                               (unsigned long long)sweep_results[index].fully_supported_recovered,
+                               33.0 > 0.0 ? 100.0 * sweep_results[index].fully_supported_recovered / 33.0 : 0.0,
+                               gen_total_meaningful > 0 ? (double)sweep_results[index].candidates_emitted / gen_total_meaningful : 0.0);
                 }
                 printf("================================================-----------------------------------------\n");
+                free(sweep_queries);
             }
 
             if (gold_seen_in_train_count > 0) {
@@ -734,6 +769,7 @@ static void evaluate_context_model(BackpropTrainer *trainer,
     }
     free(input);
     free(output);
+}
 }
 
 int main(int argc, char *argv[]) {
@@ -1251,6 +1287,16 @@ int main(int argc, char *argv[]) {
                 printf("Held-out triangles: %zu\n", test_chain->count);
                 printf("Shared vocabulary: %zu words\n", shared_vocab->count);
                 printf("Training documents: %d\n", argc - 3);
+
+                if (train_chain->count == 0) {
+                    fprintf(stderr,
+                            "No training triangles were created. Check that the training file exists and is valid CoNLL-U.\n");
+                    free_triangles(train_chain);
+                    free_triangles(test_chain);
+                    vocab_free(shared_vocab);
+                    free(file_content);
+                    return 1;
+                }
 
                 if (use_mode_b && rel_reg) {
                     printf("\n=== Running in Unsupervised Discovery Mode (Mode B) ===\n");
