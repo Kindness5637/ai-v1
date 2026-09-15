@@ -21,6 +21,7 @@ typedef struct {
     int triangle_id;
     int rotation;
     int word_ids[3];
+    int role_ids[3];
     int word_id;
     uint64_t signature;
 } ContextNode;
@@ -54,9 +55,21 @@ void context_graph_query(const ContextGraph *graph, const TriangleChain *chain,
 size_t context_graph_collect_candidates(const ContextGraph *graph,
                                         int first_word_id, int second_word_id,
                                         int *candidate_ids, size_t max_candidates);
+size_t context_graph_collect_candidates_scoped(const ContextGraph *graph,
+                                               int first_word_id, int first_role_id,
+                                               int second_word_id, int second_role_id,
+                                               int rotation,
+                                               int *candidate_ids,
+                                               size_t max_candidates);
 size_t context_graph_collect_candidate_evidence(const ContextGraph *graph,
                                                 int first_word_id, int second_word_id,
                                                 ContextCandidate *candidates,
                                                 size_t max_candidates);
+size_t context_graph_collect_candidate_evidence_scoped(const ContextGraph *graph,
+                                                       int first_word_id, int first_role_id,
+                                                       int second_word_id, int second_role_id,
+                                                       int rotation,
+                                                       ContextCandidate *candidates,
+                                                       size_t max_candidates);
 
 #endif

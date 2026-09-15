@@ -16,9 +16,17 @@ typedef struct {
 } Word;
 
 typedef struct {
+    char *key;
+    int word_index;
+} VocabHashEntry;
+
+typedef struct {
     Word *words;
     size_t count;
     size_t capacity;
+    VocabHashEntry *index;
+    size_t index_capacity;
+    size_t index_count;
 } Vocabulary;
 
 typedef struct {

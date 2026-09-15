@@ -117,8 +117,11 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             int first_id = chain->triangles[t].word_ids[rotation];
             int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
             int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
-            size_t count = context_graph_collect_candidates(
-                graph, first_id, second_id, candidate_ids, 256);
+            int first_role = chain->triangles[t].role_ids[rotation];
+            int second_role = chain->triangles[t].role_ids[(rotation + 1) % 3];
+            size_t count = context_graph_collect_candidates_scoped(
+                graph, first_id, first_role, second_id, second_role, rotation,
+                candidate_ids, 256);
             total++;
             if (count == 0) continue;
             pair_queries++;
@@ -126,12 +129,11 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             if (count > 1) ambiguous_pairs++;
             if ((int)count > max_candidates) max_candidates = (int)count;
             ContextCandidate evidence[256];
-            size_t evidence_count = context_graph_collect_candidate_evidence(
-                graph, first_id, second_id, evidence, 256);
-            fill_model_input(input, 0, first_id,
-                             chain->triangles[t].role_ids[rotation], trainer->network);
-            fill_model_input(input, 1, second_id,
-                             chain->triangles[t].role_ids[(rotation + 1) % 3], trainer->network);
+            size_t evidence_count = context_graph_collect_candidate_evidence_scoped(
+                graph, first_id, first_role, second_id, second_role, rotation,
+                evidence, 256);
+            fill_model_input(input, 0, first_id, first_role, trainer->network);
+            fill_model_input(input, 1, second_id, second_role, trainer->network);
             backprop_predict(trainer, input, output);
             double scores[256];
             double target_score = -INFINITY;

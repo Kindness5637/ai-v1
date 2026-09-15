@@ -46,6 +46,7 @@ ContextGraph *context_graph_create(const TriangleChain *chain) {
             node->rotation = rotation;
             for (int i = 0; i < 3; i++) {
                 node->word_ids[i] = triangle->word_ids[(rotation + i) % 3];
+                node->role_ids[i] = triangle->role_ids[(rotation + i) % 3];
             }
             node->signature = signature_for(triangle->word_ids, rotation);
 
@@ -204,31 +205,58 @@ void context_graph_query(const ContextGraph *graph, const TriangleChain *chain,
     }
 }
 
+static int context_node_matches_pair(const ContextNode *node,
+                                     int first_word_id, int first_role_id,
+                                     int second_word_id, int second_role_id,
+                                     int rotation) {
+    if (!node || node->type != CONTEXT_TRIANGLE_NODE) return 0;
+    if (node->word_ids[0] != first_word_id ||
+        node->word_ids[1] != second_word_id) return 0;
+    if (first_role_id > 0 && node->role_ids[0] != first_role_id) return 0;
+    if (second_role_id > 0 && node->role_ids[1] != second_role_id) return 0;
+    if (rotation >= 0 && node->rotation != rotation) return 0;
+    return 1;
+}
+
+static void add_unique_candidate(int candidate_id, int *candidate_ids,
+                                 size_t *count, size_t max_candidates) {
+    if (candidate_id <= 0 || *count >= max_candidates) return;
+    for (size_t j = 0; j < *count; j++) {
+        if (candidate_ids[j] == candidate_id) return;
+    }
+    candidate_ids[(*count)++] = candidate_id;
+}
+
 size_t context_graph_collect_candidates(const ContextGraph *graph,
                                         int first_word_id, int second_word_id,
                                         int *candidate_ids, size_t max_candidates) {
+    return context_graph_collect_candidates_scoped(
+        graph, first_word_id, 0, second_word_id, 0, -1,
+        candidate_ids, max_candidates);
+}
+
+size_t context_graph_collect_candidates_scoped(const ContextGraph *graph,
+                                               int first_word_id, int first_role_id,
+                                               int second_word_id, int second_role_id,
+                                               int rotation,
+                                               int *candidate_ids,
+                                               size_t max_candidates) {
     if (!graph || !candidate_ids || max_candidates == 0) return 0;
     size_t count = 0;
     for (size_t i = 0; i < graph->node_count && count < max_candidates; i++) {
         const ContextNode *node = &graph->nodes[i];
-        if (node->type != CONTEXT_TRIANGLE_NODE ||
-            node->word_ids[0] != first_word_id ||
-            node->word_ids[1] != second_word_id) continue;
+        if (!context_node_matches_pair(node, first_word_id, first_role_id,
+                                       second_word_id, second_role_id,
+                                       rotation)) continue;
 
-        int candidates[2] = {node->word_ids[2], 0};
+        add_unique_candidate(node->word_ids[2], candidate_ids, &count,
+                             max_candidates);
         /* Neighbor bonds preserve the same rotation three context nodes later. */
         if (node->id + 3 <= (int)graph->node_count &&
             graph->nodes[node->id + 2].type == CONTEXT_TRIANGLE_NODE) {
             const ContextNode *neighbor = &graph->nodes[node->id + 2];
-            candidates[1] = neighbor->word_ids[2];
-        }
-        for (int c = 0; c < 2; c++) {
-            if (candidates[c] <= 0) continue;
-            int exists = 0;
-            for (size_t j = 0; j < count; j++) {
-                if (candidate_ids[j] == candidates[c]) exists = 1;
-            }
-            if (!exists && count < max_candidates) candidate_ids[count++] = candidates[c];
+            add_unique_candidate(neighbor->word_ids[2], candidate_ids, &count,
+                                 max_candidates);
         }
     }
     return count;
@@ -238,13 +266,26 @@ size_t context_graph_collect_candidate_evidence(const ContextGraph *graph,
                                                 int first_word_id, int second_word_id,
                                                 ContextCandidate *candidates,
                                                 size_t max_candidates) {
+    return context_graph_collect_candidate_evidence_scoped(
+        graph, first_word_id, 0, second_word_id, 0, -1,
+        candidates, max_candidates);
+}
+
+size_t context_graph_collect_candidate_evidence_scoped(const ContextGraph *graph,
+                                                       int first_word_id,
+                                                       int first_role_id,
+                                                       int second_word_id,
+                                                       int second_role_id,
+                                                       int rotation,
+                                                       ContextCandidate *candidates,
+                                                       size_t max_candidates) {
     if (!graph || !candidates || max_candidates == 0) return 0;
     size_t count = 0;
     for (size_t i = 0; i < graph->node_count; i++) {
         const ContextNode *node = &graph->nodes[i];
-        if (node->type != CONTEXT_TRIANGLE_NODE ||
-            node->word_ids[0] != first_word_id ||
-            node->word_ids[1] != second_word_id) continue;
+        if (!context_node_matches_pair(node, first_word_id, first_role_id,
+                                       second_word_id, second_role_id,
+                                       rotation)) continue;
 
         int next_ids[2] = {node->word_ids[2], 0};
         if (node->id + 3 <= (int)graph->node_count &&
