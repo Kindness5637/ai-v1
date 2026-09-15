@@ -653,7 +653,10 @@ int main(int argc, char *argv[]) {
                 combined_train[train_size] = '\0';
             }
             for (int arg = 4; combined_train && arg < argc; arg++) {
-                if (argv[arg][0] == '-') continue; /* Skip flags like -mode or -modeB */
+                if (argv[arg][0] == '-') {
+                    if (strcmp(argv[arg], "-mode") == 0 && arg + 1 < argc) arg++;
+                    continue;
+                }
                 char *extra_content = read_file(argv[arg]);
 
                 if (!extra_content) {
@@ -662,6 +665,7 @@ int main(int argc, char *argv[]) {
                     combined_train = NULL;
                     break;
                 }
+
                 size_t extra_size = strlen(extra_content);
                 char *expanded = realloc(combined_train,
                                          train_size + 1 + extra_size + 1);
