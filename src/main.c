@@ -327,6 +327,86 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                    gold_never_seen_in_train_count);
             printf("=========================================================\n");
 
+            /* Diagnostic Audit for the 84 Exact-Pair Misses */
+            if (gold_never_seen_in_train_count > 0) {
+                int recoverable = 0;
+                int pos_ok_trans_weak = 0;
+                int trans_ok_pos_weak = 0;
+                int no_relational_support = 0;
+
+                for (size_t t = 0; t < limit; t++) {
+                    for (int rotation = 0; rotation < 3; rotation++) {
+                        int first_id = chain->triangles[t].word_ids[rotation];
+                        int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+                        int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+                        if (target_id <= 0) continue;
+
+                        ContextCandidate evidence[256];
+                        size_t count = context_graph_collect_candidate_evidence_relational(
+                            graph, rel_reg, first_id, second_id, rotation, evidence, 256);
+                        if (count == 0) continue;
+
+                        int in_candidates = 0;
+                        for (size_t c = 0; c < count; c++) {
+                            if (evidence[c].word_id == target_id) { in_candidates = 1; break; }
+                        }
+
+                        if (!in_candidates) {
+                            int seen_in_graph = 0;
+                            for (size_t i = 0; i < graph->node_count; i++) {
+                                const ContextNode *node = &graph->nodes[i];
+                                if (node->type == CONTEXT_TRIANGLE_NODE &&
+                                    node->word_ids[0] == first_id &&
+                                    node->word_ids[1] == second_id &&
+                                    node->rotation == rotation &&
+                                    node->word_ids[2] == target_id) {
+                                    seen_in_graph = 1;
+                                    break;
+                                }
+                            }
+                            if (!seen_in_graph && target_id > 0 && (size_t)target_id <= rel_reg->vocab_size) {
+                                const RelationalWordStats *stats = &rel_reg->word_stats[target_id];
+                                double total_cnt = (double)(stats->left_count + stats->center_count + stats->right_count);
+                                int target_position = (rotation >= 0) ? (rotation + 2) % 3 : 2;
+                                double pos_ratio = 0.0;
+                                if (total_cnt > 0.0) {
+                                    if (target_position == 0) pos_ratio = (double)stats->left_count / total_cnt;
+                                    else if (target_position == 1) pos_ratio = (double)stats->center_count / total_cnt;
+                                    else pos_ratio = (double)stats->right_count / total_cnt;
+                                }
+
+                                uint64_t fwd = 0, bwd = 0;
+                                if (target_position == 2) {
+                                    fwd = relational_registry_get_transition_count(rel_reg, second_id, target_id, 1);
+                                    bwd = relational_registry_get_transition_count(rel_reg, target_id, second_id, 2);
+                                } else if (target_position == 0) {
+                                    fwd = relational_registry_get_transition_count(rel_reg, target_id, first_id, 0);
+                                    bwd = relational_registry_get_transition_count(rel_reg, first_id, target_id, 3);
+                                } else if (target_position == 1) {
+                                    fwd = relational_registry_get_transition_count(rel_reg, second_id, target_id, 0);
+                                    bwd = relational_registry_get_transition_count(rel_reg, target_id, second_id, 3);
+                                }
+
+                                int pos_ok = (pos_ratio >= 0.15);
+                                int trans_ok = (fwd + bwd > 0);
+
+                                if (pos_ok && trans_ok) recoverable++;
+                                else if (pos_ok && !trans_ok) pos_ok_trans_weak++;
+                                else if (!pos_ok && trans_ok) trans_ok_pos_weak++;
+                                else no_relational_support++;
+                            }
+                        }
+                    }
+                }
+
+                printf("\n=== Audit of the 84 Exact-Pair Misses (Relational Support Breakdown) ===\n");
+                printf("  ├─ Fully Recoverable (Pos Ratio >= 0.15 AND Transition > 0): %d\n", recoverable);
+                printf("  ├─ Positional Compatible (Pos Ratio >= 0.15), Weak Transition: %d\n", pos_ok_trans_weak);
+                printf("  ├─ Transition Supported (Transition > 0), Weak Positional Ratio: %d\n", trans_ok_pos_weak);
+                printf("  └─ No Relational Support (Neither Position nor Transition): %d\n", no_relational_support);
+                printf("=========================================================================\n");
+            }
+
             if (gold_seen_in_train_count > 0) {
                 printf("\n=== Experiment A: Detailed Trace of the %d Confirmed Information-Loss Queries ===\n",
                        gold_seen_in_train_count);
