@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include "triangle.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     int first_id;
     int second_id;
@@ -29,5 +33,9 @@ int run_threshold_sweep_cuda(const ThresholdSweepQuery *queries,
                              const uint64_t *transition_thresholds,
                              size_t transition_threshold_count,
                              ThresholdSweepResult *results);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
