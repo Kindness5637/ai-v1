@@ -330,9 +330,9 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             if (gold_seen_in_train_count > 0) {
                 printf("\n=== Experiment A: Detailed Trace of the %d Confirmed Information-Loss Queries ===\n",
                        gold_seen_in_train_count);
-                printf("%-5s %-15s %-15s %-15s %-10s %-12s\n",
-                       "Rot", "Word1 (W0)", "Word2 (W1)", "Gold (W2)", "CandCount", "Reason");
-                printf("-------------------------------------------------------------------------------\n");
+                printf("%-5s %-15s %-15s %-15s %-10s %-12s %-18s\n",
+                       "Rot", "Word1 (W0)", "Word2 (W1)", "Gold (W2)", "Cap(256)", "UncappedTotal", "Reason");
+                printf("---------------------------------------------------------------------------------------------\n");
                 for (size_t t = 0; t < limit; t++) {
                     for (int rotation = 0; rotation < 3; rotation++) {
                         int first_id = chain->triangles[t].word_ids[rotation];
@@ -363,18 +363,21 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                                 }
                             }
                             if (seen_in_graph) {
+                                ContextCandidate uncapped_evidence[4096];
+                                size_t uncapped_count = context_graph_collect_candidate_evidence_relational(
+                                    graph, rel_reg, first_id, second_id, rotation, uncapped_evidence, 4096);
                                 const char *w1 = vocab_get_word(chain->vocab, first_id);
                                 const char *w2 = vocab_get_word(chain->vocab, second_id);
                                 const char *gold = vocab_get_word(chain->vocab, target_id);
                                 const char *reason = (count >= 256) ? "256 Cap Truncation" : "Traversal/Scoping Miss";
-                                printf("%-5d %-15s %-15s %-15s %-10zu %-12s\n",
+                                printf("%-5d %-15s %-15s %-15s %-10zu %-12zu %-18s\n",
                                        rotation, w1 ? w1 : "?", w2 ? w2 : "?", gold ? gold : "?",
-                                       count, reason);
+                                       count, uncapped_count, reason);
                             }
                         }
                     }
                 }
-                printf("================================================-------------------------------\n");
+                printf("================================================---------------------------------------------\n");
             }
         }
     }
