@@ -430,13 +430,28 @@ size_t context_graph_collect_candidate_evidence_relational(const ContextGraph *g
                 pos_ratio = (double)stats->right_count / total;
         }
 
-        /* Forward transition: second_word → candidate in the target direction */
-        uint64_t fwd = relational_registry_get_transition_count(
-            rel_reg, second_word_id, cand_id, (target_position == 2) ? 1 : 0);
+        uint64_t fwd = 0;
+        uint64_t bwd = 0;
 
-        /* Backward transition: candidate → second_word in the reverse direction */
-        uint64_t bwd = relational_registry_get_transition_count(
-            rel_reg, cand_id, second_word_id, (target_position == 2) ? 2 : 3);
+        if (target_position == 2) {
+            /* Target is RIGHT (cand_id == R): known context word second_word_id is CENTER
+             * Forward: CENTER -> candidate (R) [type 1: C -> R]
+             * Backward: candidate (R) -> CENTER [type 2: R -> C] */
+            fwd = relational_registry_get_transition_count(rel_reg, second_word_id, cand_id, 1);
+            bwd = relational_registry_get_transition_count(rel_reg, cand_id, second_word_id, 2);
+        } else if (target_position == 0) {
+            /* Target is LEFT (cand_id == L): known context word first_word_id is CENTER
+             * Forward: candidate (L) -> CENTER [type 0: L -> C]
+             * Backward: CENTER -> candidate (L) [type 3: C -> L] */
+            fwd = relational_registry_get_transition_count(rel_reg, cand_id, first_word_id, 0);
+            bwd = relational_registry_get_transition_count(rel_reg, first_word_id, cand_id, 3);
+        } else if (target_position == 1) {
+            /* Target is CENTER (cand_id == C): known context word second_word_id is LEFT
+             * Forward: LEFT (second_word_id) -> candidate (C) [type 0: L -> C]
+             * Backward: candidate (C) -> LEFT (second_word_id) [type 3: C -> L] */
+            fwd = relational_registry_get_transition_count(rel_reg, second_word_id, cand_id, 0);
+            bwd = relational_registry_get_transition_count(rel_reg, cand_id, second_word_id, 3);
+        }
 
         double transition_strength = log1p((double)(fwd + bwd));
         double transition_compat = transition_strength / (1.0 + transition_strength);
