@@ -56,7 +56,15 @@ typedef struct {
     size_t total_candidates;
     int nonempty_queries;
     int max_candidates;
+    int cap_hit_queries;      /* queries whose candidate count hit the cap */
+    double median_candidates; /* median per-query candidate count (all queries) */
+    size_t *cand_counts;      /* per-query candidate counts, for median */
 } UnifiedEvalMetrics;
+
+static int cmp_size_t(const void *a, const void *b) {
+    size_t x = *(const size_t *)a, y = *(const size_t *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
 
 typedef struct {
     int from_word_id;
@@ -642,10 +650,10 @@ static void write_unified_eval_csv(const UnifiedEvalMetrics *metrics,
     mkdir("results", 0755);
     FILE *f = fopen("results/unified_eval.csv", "w");
     if (!f) return;
-    fprintf(f, "mode,queries,candidate_recall,top1,top5,mrr,avg_candidates,nonempty_queries,max_candidates\n");
+    fprintf(f, "mode,queries,candidate_recall,top1,top5,mrr,avg_candidates,nonempty_queries,max_candidates,median_candidates,cap_hit_queries,cap_hit_rate\n");
     for (size_t i = 0; i < mode_count; i++) {
         const UnifiedEvalMetrics *m = &metrics[i];
-        fprintf(f, "%s,%d,%.4f,%.4f,%.4f,%.6f,%.2f,%d,%d\n",
+        fprintf(f, "%s,%d,%.4f,%.4f,%.4f,%.6f,%.2f,%d,%d,%.2f,%d,%.4f\n",
                 m->name,
                 m->query_count,
                 m->query_count > 0 ? (double)m->candidate_hits / m->query_count : 0.0,
@@ -654,7 +662,10 @@ static void write_unified_eval_csv(const UnifiedEvalMetrics *metrics,
                 m->query_count > 0 ? m->mrr_sum / m->query_count : 0.0,
                 m->query_count > 0 ? (double)m->total_candidates / m->query_count : 0.0,
                 m->nonempty_queries,
-                m->max_candidates);
+                m->max_candidates,
+                m->median_candidates,
+                m->cap_hit_queries,
+                m->query_count > 0 ? (double)m->cap_hit_queries / m->query_count : 0.0);
     }
     fclose(f);
 }
@@ -692,10 +703,20 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
     }
 
     UnifiedEvalMetrics metrics[3] = {
-        {"EXACT", (int)query_count, 0, 0, 0, 0.0, 0, 0, 0},
-        {"STRUCT", (int)query_count, 0, 0, 0, 0.0, 0, 0, 0},
-        {"UNION", (int)query_count, 0, 0, 0, 0.0, 0, 0, 0}
+        {"EXACT", (int)query_count, 0, 0, 0, 0.0, 0, 0, 0, 0, 0.0, NULL},
+        {"STRUCT", (int)query_count, 0, 0, 0, 0.0, 0, 0, 0, 0, 0.0, NULL},
+        {"UNION", (int)query_count, 0, 0, 0, 0.0, 0, 0, 0, 0, 0.0, NULL}
     };
+    for (int mode = 0; mode < 3; mode++) {
+        metrics[mode].cand_counts = calloc(query_count ? query_count : 1,
+                                           sizeof(size_t));
+        if (!metrics[mode].cand_counts) {
+            fprintf(stderr, "[main] unified eval: count buffer alloc failed\n");
+            for (int m2 = 0; m2 < mode; m2++) free(metrics[m2].cand_counts);
+            free(queries);
+            return;
+        }
+    }
 
     double *input = calloc(trainer->network->input_size, sizeof(double));
     double *output = calloc(trainer->network->output_size, sizeof(double));
@@ -739,6 +760,9 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
             if (count > 0) metrics[mode].nonempty_queries++;
             if ((int)count > metrics[mode].max_candidates)
                 metrics[mode].max_candidates = (int)count;
+            if (metrics[mode].cand_counts && q < (size_t)metrics[mode].query_count)
+                metrics[mode].cand_counts[q] = count;
+            if ((int)count >= max_candidates) metrics[mode].cap_hit_queries++;
 
             double target_score = -INFINITY;
             int found = 0;
@@ -784,17 +808,39 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
             query_count, query_count);
     fflush(stderr);
 
+    for (int mode = 0; mode < 3; mode++) {
+        UnifiedEvalMetrics *m = &metrics[mode];
+        if (!m->cand_counts || query_count == 0) {
+            m->median_candidates = 0.0;
+            continue;
+        }
+        size_t *sorted = malloc(query_count * sizeof(*sorted));
+        if (!sorted) {
+            fprintf(stderr, "[main] median computation unavailable for %s (OOM)\n",
+                    m->name);
+            m->median_candidates = 0.0;
+            continue;
+        }
+        memcpy(sorted, m->cand_counts, query_count * sizeof(*sorted));
+        qsort(sorted, query_count, sizeof(*sorted), cmp_size_t);
+        m->median_candidates = (query_count % 2)
+            ? (double)sorted[query_count / 2]
+            : 0.5 * ((double)sorted[query_count / 2 - 1] +
+                     (double)sorted[query_count / 2]);
+        free(sorted);
+    }
+
     printf("\n=== Unified Held-out Candidate Evaluation (%zu shared queries) ===\n",
            query_count);
     printf("Thresholds: pos >= %.2f | transition >= %llu\n",
            position_threshold, (unsigned long long)transition_threshold);
-    printf("%-8s %-9s %-12s %-8s %-8s %-8s %-12s %-10s\n",
+    printf("%-8s %-9s %-12s %-8s %-8s %-8s %-12s %-10s %-10s %-10s\n",
            "Mode", "Queries", "CandRecall", "R@1", "R@5", "MRR",
-           "AvgCand", "MaxCand");
-    printf("--------------------------------------------------------------------------\n");
+           "AvgCand", "MaxCand", "MedianCand", "CapHit");
+    printf("--------------------------------------------------------------------------------------\n");
     for (int mode = 0; mode < 3; mode++) {
         UnifiedEvalMetrics *m = &metrics[mode];
-        printf("%-8s %-9d %-11.1f%% %-7.1f%% %-7.1f%% %-8.4f %-12.2f %-10d\n",
+        printf("%-8s %-9d %-11.1f%% %-7.1f%% %-7.1f%% %-8.4f %-12.2f %-10d %-10.1f %d/%.1f%%\n",
                m->name,
                m->query_count,
                m->query_count > 0 ? 100.0 * m->candidate_hits / m->query_count : 0.0,
@@ -802,12 +848,16 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
                m->query_count > 0 ? 100.0 * m->top5 / m->query_count : 0.0,
                m->query_count > 0 ? m->mrr_sum / m->query_count : 0.0,
                m->query_count > 0 ? (double)m->total_candidates / m->query_count : 0.0,
-               m->max_candidates);
+               m->max_candidates,
+               m->median_candidates,
+               m->cap_hit_queries,
+               m->query_count > 0 ? 100.0 * m->cap_hit_queries / m->query_count : 0.0);
     }
     printf("==========================================================================\n");
     fflush(stdout);
 
     write_unified_eval_csv(metrics, 3);
+    for (int mode = 0; mode < 3; mode++) free(metrics[mode].cand_counts);
     transition_lookup_free(lookup);
     free(input);
     free(output);
@@ -2009,6 +2059,23 @@ int main(int argc, char *argv[]) {
                         run_unified_candidate_evaluation(
                             trainer, test_chain, train_graph, rel_reg, 100,
                             pos_thresh, (uint64_t)trans_thresh);
+                        const char *unified_sweep = getenv("UNIFIED_SWEEP");
+                        if (unified_sweep && strcmp(unified_sweep, "1") == 0) {
+                            static const struct { double pos; uint64_t trans; } grid[] = {
+                                {0.20, 4}, {0.25, 4}, {0.30, 3}, {0.30, 4}, {0.35, 3}
+                            };
+                            printf("\n=== Unified Threshold Grid (UNIFIED_SWEEP) ===\n");
+                            fflush(stdout);
+                            for (size_t g = 0; g < sizeof(grid) / sizeof(grid[0]); g++) {
+                                printf("\n--- grid pos=%.2f trans=%llu ---\n",
+                                       grid[g].pos,
+                                       (unsigned long long)grid[g].trans);
+                                fflush(stdout);
+                                run_unified_candidate_evaluation(
+                                    trainer, test_chain, train_graph, rel_reg, 100,
+                                    grid[g].pos, grid[g].trans);
+                            }
+                        }
                         if (run_gpu_evaluation_only(test_chain, train_graph, rel_reg, 100) != 0)
                             fprintf(stderr, "[main] GPU evaluation failed\n");
                         run_neural_evaluation_only(trainer, test_chain, 100);
