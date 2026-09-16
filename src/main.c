@@ -821,6 +821,27 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
     BackpropTrainer *mutable_trainer = (BackpropTrainer *)trainer;
     TransitionLookup *lookup = transition_lookup_create(rel_reg);
 
+    /* SCORER_DIAG=1: attribution instrumentation only. Scoring itself is
+       untouched; default output is byte-identical when the flag is unset. */
+    const char *sd_env = getenv("SCORER_DIAG");
+    int scorer_diag = (sd_env && strcmp(sd_env, "1") == 0);
+    int sd_hits = 0;
+    int sd_hist[4] = {0, 0, 0, 0}; /* rank 1 / 2-5 / 6-20 / >20 */
+    long sd_attr_dist = 0, sd_attr_bonus = 0, sd_attr_match = 0;
+    int sd_worsened = 0;
+    long sd_un_noise_exact = 0, sd_un_noise_struct = 0;
+    FILE *sd_csv = NULL;
+    if (scorer_diag) {
+        mkdir("results", 0755);
+        sd_csv = fopen("results/scorer_diag.csv", "w");
+        if (sd_csv)
+            fprintf(sd_csv, "first_id,second_id,rotation,target_id,pos_threshold,"
+                            "trans_threshold,gold_rank,gold_dist,gold_bonus,"
+                            "gold_match,n_outrankers,n_out_dist,n_out_bonus,n_out_match\n");
+        else
+            fprintf(stderr, "[main] SCORER_DIAG: could not open results/scorer_diag.csv\n");
+    }
+
     fprintf(stderr,
             "[main] unified evaluation starting: %zu queries, %zu transitions\n",
             query_count, rel_reg->transition_count);
@@ -867,8 +888,15 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
 
             double target_score = -INFINITY;
             int found = 0;
+            double gold_dist = 0.0, gold_bonus = 0.0, gold_match = 0.0;
+            double cand_dist[1024];
+            double cand_match0[1024];
             for (size_t c = 0; c < count; c++) {
                 int candidate_id = candidates[c].word_id;
+                cand_dist[c] = 0.0;
+                /* keep the ORIGINAL match_score: it is overwritten with the
+                   full score below, but the attribution needs the raw term */
+                cand_match0[c] = candidates[c].match_score;
                 if (candidate_id <= 0 || candidate_id > vocab_size) continue;
 
                 double distance = 0.0;
@@ -878,6 +906,7 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
                         trainer->network->embeddings[(candidate_id - 1) * embed_dim + d];
                     distance += delta * delta;
                 }
+                cand_dist[c] = distance;
 
                 double score = -distance +
                     0.75 * log(1.0 + candidates[c].occurrence_count) +
@@ -888,6 +917,10 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
                 if (candidate_id == query->target_id) {
                     found = 1;
                     target_score = score;
+                    gold_dist = distance;
+                    gold_bonus = 0.75 * log(1.0 + candidates[c].occurrence_count) +
+                                 0.50 * log(1.0 + candidates[c].neighbor_count);
+                    gold_match = cand_match0[c];
                 }
             }
 
@@ -901,6 +934,70 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
                     if (candidates[c].match_score > target_score) rank++;
                 }
                 rec->rank[mode] = rank;
+
+                if (scorer_diag) {
+                    if (mode == 1) {
+                        if (rank == 0) sd_hist[0]++;
+                        else if (rank < 5) sd_hist[1]++;
+                        else if (rank < 20) sd_hist[2]++;
+                        else sd_hist[3]++;
+
+                        int n_out = 0, n_dist = 0, n_bonus = 0, n_match = 0;
+                        for (size_t c = 0; c < count; c++) {
+                            int candidate_id = candidates[c].word_id;
+                            if (candidate_id <= 0 || candidate_id > vocab_size) continue;
+                            if (candidates[c].match_score <= target_score) continue;
+                            /* Lexicographic first-flip attribution: attribute the
+                               win to the FIRST score component in the chain
+                               distance -> bonus -> match whose partial score
+                               already beats gold. NOTE: this does not model
+                               interactions between components; it classifies the
+                               minimal sufficient component. */
+                            double s1c = -cand_dist[c], s1g = -gold_dist;
+                            n_out++;
+                            if (s1c > s1g) {
+                                n_dist++;
+                                sd_attr_dist++;
+                            } else {
+                                double s2c = s1c +
+                                    0.75 * log(1.0 + candidates[c].occurrence_count) +
+                                    0.50 * log(1.0 + candidates[c].neighbor_count);
+                                double s2g = s1g + gold_bonus;
+                                if (s2c > s2g) {
+                                    n_bonus++;
+                                    sd_attr_bonus++;
+                                } else {
+                                    n_match++;
+                                    sd_attr_match++;
+                                }
+                            }
+                        }
+                        sd_hits++;
+                        if (sd_csv)
+                            fprintf(sd_csv, "%d,%d,%d,%d,%.2f,%llu,%d,%.6f,%.6f,%.6f,%d,%d,%d,%d\n",
+                                    query->first_id, query->second_id, query->rotation,
+                                    query->target_id, position_threshold,
+                                    (unsigned long long)transition_threshold,
+                                    rank, gold_dist, gold_bonus, gold_match,
+                                    n_out, n_dist, n_bonus, n_match);
+                    } else if (mode == 2 && rec->rank[1] >= 0 &&
+                               rank > rec->rank[1]) {
+                        /* Worsened by UNION: are the new outrankers of gold
+                           EXACT-sourced or STRUCT-sourced? merge_candidate_sets
+                           preserves the base (EXACT) entries at indices
+                           [0, exact_n) and appends STRUCT entries after. */
+                        ContextCandidate scratch[1024];
+                        size_t exact_n = context_graph_collect_candidate_evidence_fallback(
+                            graph, query->first_id, 0, query->second_id, 0,
+                            query->rotation, scratch, (size_t)max_candidates);
+                        for (size_t c = 0; c < count; c++) {
+                            if (candidates[c].match_score <= target_score) continue;
+                            if ((int)c < (int)exact_n) sd_un_noise_exact++;
+                            else sd_un_noise_struct++;
+                        }
+                        sd_worsened++;
+                    }
+                }
             }
             if (!found) continue;
             metrics[mode].candidate_hits++;
@@ -1044,6 +1141,26 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
            (int)query_count - elig_gold_eligible);
     printf("==========================================================================\n");
     fflush(stdout);
+
+    if (scorer_diag) {
+        printf("\n=== Scorer Failure Attribution (SCORER_DIAG, %d STRUCT hits) ===\n",
+               sd_hits);
+        printf("Gold rank among STRUCT candidates:\n");
+        printf("  rank 1    : %d\n", sd_hist[0]);
+        printf("  rank 2-5  : %d\n", sd_hist[1]);
+        printf("  rank 6-20 : %d\n", sd_hist[2]);
+        printf("  rank >20  : %d\n", sd_hist[3]);
+        printf("Outranker attribution (first component whose partial score beats gold):\n");
+        printf("  distance alone : %ld\n", sd_attr_dist);
+        printf("  occ/neigh bonus: %ld\n", sd_attr_bonus);
+        printf("  match_score    : %ld\n", sd_attr_match);
+        printf("UNION noise attribution (%d worsened queries):\n", sd_worsened);
+        printf("  outrankers of gold from EXACT side  : %ld\n", sd_un_noise_exact);
+        printf("  outrankers of gold from STRUCT side : %ld\n", sd_un_noise_struct);
+        printf("==========================================================================\n");
+        fflush(stdout);
+        if (sd_csv) fclose(sd_csv);
+    }
 
     write_unified_eval_csv(metrics, 3);
     write_unified_query_csv(records, query_count, position_threshold,
