@@ -44,6 +44,8 @@ typedef struct {
     int target_id;
     int rotation;
     int target_position;
+    int first_role;   /* UPOS role of first_id, as used at training time */
+    int second_role;  /* UPOS role of second_id, as used at training time */
 } EvaluationQuery;
 
 typedef struct {
@@ -238,6 +240,40 @@ static void fill_model_input(double *input, int slot, int word_id, int role_id,
         input[slot * feature_dim + network->embed_dim + r] =
             role_id == r + 1 ? 1.0 : 0.0;
     }
+}
+
+/* Role checker: resolve the UPOS role the chain associates with a word id.
+   Returns the most frequently observed NONZERO role for that word across the
+   chain's triangles, or 0 when the word never carried a tag.
+
+   Why this exists: training reads role_ids from the annotated chain, so any
+   inference path that invents a role (or silently passes 0) feeds the network
+   a different input distribution than it trained on. CLI paths receive bare
+   words with no annotation, so they look up what the chain already knows and
+   leave the rest in holding (0) rather than guessing.
+   Limitation: this is a frequency lookup over observed tags, not a predicted
+   tag; an unknown word stays 0. It does not account for the word's current
+   context. */
+static int lookup_word_role(const TriangleChain *chain, int word_id) {
+    if (!chain || word_id <= 0) return 0;
+    int counts[TRIANGLE_ROLE_FEATURE_DIM];
+    for (int r = 0; r < TRIANGLE_ROLE_FEATURE_DIM; r++) counts[r] = 0;
+    for (size_t t = 0; t < chain->count; t++) {
+        for (int p = 0; p < 3; p++) {
+            if (chain->triangles[t].word_ids[p] != word_id) continue;
+            int role = chain->triangles[t].role_ids[p];
+            if (role > 0 && role < TRIANGLE_ROLE_FEATURE_DIM) counts[role]++;
+        }
+    }
+    int best = 0;
+    int best_count = 0;
+    for (int r = 1; r < TRIANGLE_ROLE_FEATURE_DIM; r++) {
+        if (counts[r] > best_count) {
+            best_count = counts[r];
+            best = r;
+        }
+    }
+    return best;
 }
 
 static int has_conllu_suffix(const char *filename) {
@@ -611,8 +647,12 @@ static void run_neural_evaluation_only(const BackpropTrainer *trainer,
             if (target_id <= 0 || target_id > vocab_size) continue;
 
             memset(input, 0, trainer->network->input_size * sizeof(double));
-            fill_model_input(input, 0, first_id, 0, trainer->network);
-            fill_model_input(input, 1, second_id, 0, trainer->network);
+            fill_model_input(input, 0, first_id,
+                             chain->triangles[t].role_ids[rotation],
+                             trainer->network);
+            fill_model_input(input, 1, second_id,
+                             chain->triangles[t].role_ids[(rotation + 1) % 3],
+                             trainer->network);
             backprop_predict(mutable_trainer, input, output);
 
             int best_ids[5] = {-1, -1, -1, -1, -1};
@@ -776,7 +816,9 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
                 target_id > vocab_size)
                 continue;
             queries[query_count++] = (EvaluationQuery){
-                first_id, second_id, target_id, rotation, (rotation + 2) % 3
+                first_id, second_id, target_id, rotation, (rotation + 2) % 3,
+                chain->triangles[t].role_ids[rotation],
+                chain->triangles[t].role_ids[(rotation + 1) % 3]
             };
         }
     }
@@ -818,6 +860,8 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
 
     const int max_candidates = 1024;
     int embed_dim = trainer->network->embed_dim;
+    size_t role_known_queries = 0;
+    size_t role_holding_queries = 0;
     BackpropTrainer *mutable_trainer = (BackpropTrainer *)trainer;
     TransitionLookup *lookup = transition_lookup_create(rel_reg);
 
@@ -855,9 +899,18 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
         }
 
         const EvaluationQuery *query = &queries[q];
+        if (query->first_role > 0 && query->second_role > 0) role_known_queries++;
+        else role_holding_queries++;
         memset(input, 0, trainer->network->input_size * sizeof(double));
-        fill_model_input(input, 0, query->first_id, 0, trainer->network);
-        fill_model_input(input, 1, query->second_id, 0, trainer->network);
+        /* Feed the SAME role one-hots the network saw during training.
+           Hardcoding 0 here was a train/eval input mismatch: the model was
+           trained with UPOS role features active, but evaluated with the
+           whole 64-wide role block zeroed. Roles come from the held-out
+           chain (gold UPOS from the annotated file; 0 = holding/unknown). */
+        fill_model_input(input, 0, query->first_id, query->first_role,
+                         trainer->network);
+        fill_model_input(input, 1, query->second_id, query->second_role,
+                         trainer->network);
         backprop_predict(mutable_trainer, input, output);
 
         UnifiedQueryRecord *rec = &records[q];
@@ -1078,6 +1131,8 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
            query_count);
     printf("Thresholds: pos >= %.2f | transition >= %llu\n",
            position_threshold, (unsigned long long)transition_threshold);
+    printf("Eval roles: %zu queries with gold UPOS roles, %zu holding (role 0)\n",
+           role_known_queries, role_holding_queries);
     printf("%-8s %-9s %-12s %-8s %-8s %-8s %-12s %-10s %-10s %-10s\n",
            "Mode", "Queries", "CandRecall", "R@1", "R@5", "MRR",
            "AvgCand", "MaxCand", "MedianCand", "CapHit");
@@ -1202,9 +1257,10 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             int first_id = chain->triangles[t].word_ids[rotation];
             int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
             int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
-            int use_mode_b = candidate_mode == 1;
-            int first_role = use_mode_b ? 0 : chain->triangles[t].role_ids[rotation];
-            int second_role = use_mode_b ? 0 : chain->triangles[t].role_ids[(rotation + 1) % 3];
+            /* Roles always on at eval: matches the training input
+               distribution (training consumed UPOS roles from the chain). */
+            int first_role = chain->triangles[t].role_ids[rotation];
+            int second_role = chain->triangles[t].role_ids[(rotation + 1) % 3];
 
             ContextCandidate evidence[256];
             size_t count = 0;
@@ -2099,8 +2155,13 @@ int main(int argc, char *argv[]) {
                 int embed_dim = trainer->network->embed_dim;
                 double *input = calloc(trainer->network->input_size, sizeof(double));
                 double *output = calloc(trainer->network->output_size, sizeof(double));
-                fill_model_input(input, 0, first_id, 0, trainer->network);
-                fill_model_input(input, 1, second_id, 0, trainer->network);
+                /* CLI query words arrive without annotation; look up the role
+                   the chain already knows for them (0 = holding) so this path
+                   feeds the network the same role features training used. */
+                int first_role = lookup_word_role(chain, first_id);
+                int second_role = lookup_word_role(chain, second_id);
+                fill_model_input(input, 0, first_id, first_role, trainer->network);
+                fill_model_input(input, 1, second_id, second_role, trainer->network);
                 backprop_predict(trainer, input, output);
 
                 double candidate_distances[256];
