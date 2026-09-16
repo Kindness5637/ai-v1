@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include "core/triangle.h"
 #include "core/probability.h"
@@ -36,6 +37,26 @@ typedef struct {
     double mrr;
     double avg_candidates;
 } BaselineMetrics;
+
+typedef struct {
+    int first_id;
+    int second_id;
+    int target_id;
+    int rotation;
+    int target_position;
+} EvaluationQuery;
+
+typedef struct {
+    const char *name;
+    int query_count;
+    int candidate_hits;
+    int top1;
+    int top5;
+    double mrr_sum;
+    size_t total_candidates;
+    int nonempty_queries;
+    int max_candidates;
+} UnifiedEvalMetrics;
 
 static void write_baseline_report(const BaselineMetrics *m) {
     mkdir("results", 0755);
@@ -243,6 +264,77 @@ static void run_threshold_sweep_cpu(const ThresholdSweepQuery *queries,
     }
 }
 
+static size_t collect_structural_vocab_candidates(const RelationalRegistry *rel_reg,
+                                                  int first_id,
+                                                  int second_id,
+                                                  int target_position,
+                                                  double position_threshold,
+                                                  uint64_t transition_threshold,
+                                                  ContextCandidate *candidates,
+                                                  size_t max_candidates) {
+    if (!rel_reg || !candidates || max_candidates == 0) return 0;
+
+    size_t count = 0;
+    for (size_t word = 1; word <= rel_reg->vocab_size; word++) {
+        const RelationalWordStats *stats = &rel_reg->word_stats[word];
+        double total = (double)(stats->left_count +
+                                stats->center_count +
+                                stats->right_count);
+        if (total <= 0.0) continue;
+
+        uint64_t position_count = target_position == 0 ? stats->left_count :
+                                  target_position == 1 ? stats->center_count :
+                                                         stats->right_count;
+        double position_ratio = (double)position_count / total;
+        if (position_ratio < position_threshold) continue;
+
+        ThresholdSweepQuery query = {
+            first_id, second_id, (int)word, target_position
+        };
+        uint64_t transition_count = threshold_transition_count(
+            rel_reg, &query, (int)word);
+        if (transition_count < transition_threshold) continue;
+
+        double transition_strength = log1p((double)transition_count);
+        double transition_compat = transition_strength / (1.0 + transition_strength);
+        double relational_compat = position_ratio * (0.5 + 0.5 * transition_compat);
+
+        candidates[count++] = (ContextCandidate){
+            (int)word,
+            (int)position_count,
+            transition_count > (uint64_t)INT_MAX ? INT_MAX : (int)transition_count,
+            relational_compat
+        };
+        if (count == max_candidates) break;
+    }
+    return count;
+}
+
+static size_t merge_candidate_sets(ContextCandidate *base,
+                                   size_t base_count,
+                                   const ContextCandidate *extra,
+                                   size_t extra_count,
+                                   size_t max_candidates) {
+    size_t count = base_count;
+    for (size_t i = 0; i < extra_count; i++) {
+        int duplicate = 0;
+        for (size_t j = 0; j < count; j++) {
+            if (base[j].word_id != extra[i].word_id) continue;
+            if (extra[i].occurrence_count > base[j].occurrence_count)
+                base[j].occurrence_count = extra[i].occurrence_count;
+            if (extra[i].neighbor_count > base[j].neighbor_count)
+                base[j].neighbor_count = extra[i].neighbor_count;
+            if (extra[i].match_score > base[j].match_score)
+                base[j].match_score = extra[i].match_score;
+            duplicate = 1;
+            break;
+        }
+        if (!duplicate && count < max_candidates)
+            base[count++] = extra[i];
+    }
+    return count;
+}
+
 static int run_gpu_evaluation_only(const TriangleChain *chain,
                                    const ContextGraph *graph,
                                    const RelationalRegistry *rel_reg,
@@ -397,6 +489,201 @@ static void run_neural_evaluation_only(const BackpropTrainer *trainer,
     fflush(stdout);
     free(input);
     free(output);
+}
+
+static size_t collect_unified_candidates(const ContextGraph *graph,
+                                         const RelationalRegistry *rel_reg,
+                                         const EvaluationQuery *query,
+                                         int mode,
+                                         double position_threshold,
+                                         uint64_t transition_threshold,
+                                         ContextCandidate *candidates,
+                                         size_t max_candidates) {
+    if (!graph || !query || !candidates || max_candidates == 0) return 0;
+
+    if (mode == 0) {
+        return context_graph_collect_candidate_evidence_fallback(
+            graph, query->first_id, 0, query->second_id, 0,
+            query->rotation, candidates, max_candidates);
+    }
+
+    if (mode == 1) {
+        return collect_structural_vocab_candidates(
+            rel_reg, query->first_id, query->second_id,
+            query->target_position, position_threshold,
+            transition_threshold, candidates, max_candidates);
+    }
+
+    ContextCandidate structural[1024];
+    size_t exact_count = context_graph_collect_candidate_evidence_fallback(
+        graph, query->first_id, 0, query->second_id, 0,
+        query->rotation, candidates, max_candidates);
+    size_t structural_count = collect_structural_vocab_candidates(
+        rel_reg, query->first_id, query->second_id,
+        query->target_position, position_threshold,
+        transition_threshold, structural, 1024);
+    return merge_candidate_sets(candidates, exact_count, structural,
+                                structural_count, max_candidates);
+}
+
+static void write_unified_eval_csv(const UnifiedEvalMetrics *metrics,
+                                   size_t mode_count) {
+    mkdir("results", 0755);
+    FILE *f = fopen("results/unified_eval.csv", "w");
+    if (!f) return;
+    fprintf(f, "mode,queries,candidate_recall,top1,top5,mrr,avg_candidates,nonempty_queries,max_candidates\n");
+    for (size_t i = 0; i < mode_count; i++) {
+        const UnifiedEvalMetrics *m = &metrics[i];
+        fprintf(f, "%s,%d,%.4f,%.4f,%.4f,%.6f,%.2f,%d,%d\n",
+                m->name,
+                m->query_count,
+                m->query_count > 0 ? (double)m->candidate_hits / m->query_count : 0.0,
+                m->query_count > 0 ? (double)m->top1 / m->query_count : 0.0,
+                m->query_count > 0 ? (double)m->top5 / m->query_count : 0.0,
+                m->query_count > 0 ? m->mrr_sum / m->query_count : 0.0,
+                m->query_count > 0 ? (double)m->total_candidates / m->query_count : 0.0,
+                m->nonempty_queries,
+                m->max_candidates);
+    }
+    fclose(f);
+}
+
+static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
+                                             const TriangleChain *chain,
+                                             const ContextGraph *graph,
+                                             const RelationalRegistry *rel_reg,
+                                             size_t limit,
+                                             double position_threshold,
+                                             uint64_t transition_threshold) {
+    if (!trainer || !trainer->network || !chain || !graph || !rel_reg) return;
+    if (limit > chain->count) limit = chain->count;
+
+    size_t query_capacity = limit * 3;
+    EvaluationQuery *queries = calloc(query_capacity ? query_capacity : 1,
+                                      sizeof(*queries));
+    if (!queries) return;
+
+    size_t query_count = 0;
+    int vocab_size = trainer->network->vocab_size;
+    for (size_t t = 0; t < limit; t++) {
+        for (int rotation = 0; rotation < 3; rotation++) {
+            int first_id = chain->triangles[t].word_ids[rotation];
+            int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+            int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+            if (first_id <= 0 || second_id <= 0 || target_id <= 0 ||
+                first_id > vocab_size || second_id > vocab_size ||
+                target_id > vocab_size)
+                continue;
+            queries[query_count++] = (EvaluationQuery){
+                first_id, second_id, target_id, rotation, (rotation + 2) % 3
+            };
+        }
+    }
+
+    UnifiedEvalMetrics metrics[3] = {
+        {"EXACT", (int)query_count, 0, 0, 0, 0.0, 0, 0, 0},
+        {"STRUCT", (int)query_count, 0, 0, 0, 0.0, 0, 0, 0},
+        {"UNION", (int)query_count, 0, 0, 0, 0.0, 0, 0, 0}
+    };
+
+    double *input = calloc(trainer->network->input_size, sizeof(double));
+    double *output = calloc(trainer->network->output_size, sizeof(double));
+    if (!input || !output) {
+        free(input);
+        free(output);
+        free(queries);
+        return;
+    }
+
+    const int max_candidates = 1024;
+    int embed_dim = trainer->network->embed_dim;
+    BackpropTrainer *mutable_trainer = (BackpropTrainer *)trainer;
+
+    for (size_t q = 0; q < query_count; q++) {
+        const EvaluationQuery *query = &queries[q];
+        memset(input, 0, trainer->network->input_size * sizeof(double));
+        fill_model_input(input, 0, query->first_id, 0, trainer->network);
+        fill_model_input(input, 1, query->second_id, 0, trainer->network);
+        backprop_predict(mutable_trainer, input, output);
+
+        for (int mode = 0; mode < 3; mode++) {
+            ContextCandidate candidates[1024];
+            size_t count = collect_unified_candidates(
+                graph, rel_reg, query, mode, position_threshold,
+                transition_threshold, candidates, max_candidates);
+
+            metrics[mode].total_candidates += count;
+            if (count > 0) metrics[mode].nonempty_queries++;
+            if ((int)count > metrics[mode].max_candidates)
+                metrics[mode].max_candidates = (int)count;
+
+            double target_score = -INFINITY;
+            int found = 0;
+            for (size_t c = 0; c < count; c++) {
+                int candidate_id = candidates[c].word_id;
+                if (candidate_id <= 0 || candidate_id > vocab_size) continue;
+
+                double distance = 0.0;
+                int target_start = query->target_position * embed_dim;
+                for (int d = 0; d < embed_dim; d++) {
+                    double delta = output[target_start + d] -
+                        trainer->network->embeddings[(candidate_id - 1) * embed_dim + d];
+                    distance += delta * delta;
+                }
+
+                double score = -distance +
+                    0.75 * log(1.0 + candidates[c].occurrence_count) +
+                    0.50 * log(1.0 + candidates[c].neighbor_count) +
+                    candidates[c].match_score;
+                candidates[c].match_score = score;
+
+                if (candidate_id == query->target_id) {
+                    found = 1;
+                    target_score = score;
+                }
+            }
+
+            if (!found) continue;
+            metrics[mode].candidate_hits++;
+            int rank = 0;
+            for (size_t c = 0; c < count; c++) {
+                int candidate_id = candidates[c].word_id;
+                if (candidate_id <= 0 || candidate_id > vocab_size) continue;
+                if (candidates[c].match_score > target_score) rank++;
+            }
+            if (rank == 0) metrics[mode].top1++;
+            if (rank < 5) metrics[mode].top5++;
+            metrics[mode].mrr_sum += 1.0 / (rank + 1);
+        }
+    }
+
+    printf("\n=== Unified Held-out Candidate Evaluation (%zu shared queries) ===\n",
+           query_count);
+    printf("Thresholds: pos >= %.2f | transition >= %llu\n",
+           position_threshold, (unsigned long long)transition_threshold);
+    printf("%-8s %-9s %-12s %-8s %-8s %-8s %-12s %-10s\n",
+           "Mode", "Queries", "CandRecall", "R@1", "R@5", "MRR",
+           "AvgCand", "MaxCand");
+    printf("--------------------------------------------------------------------------\n");
+    for (int mode = 0; mode < 3; mode++) {
+        UnifiedEvalMetrics *m = &metrics[mode];
+        printf("%-8s %-9d %-11.1f%% %-7.1f%% %-7.1f%% %-8.4f %-12.2f %-10d\n",
+               m->name,
+               m->query_count,
+               m->query_count > 0 ? 100.0 * m->candidate_hits / m->query_count : 0.0,
+               m->query_count > 0 ? 100.0 * m->top1 / m->query_count : 0.0,
+               m->query_count > 0 ? 100.0 * m->top5 / m->query_count : 0.0,
+               m->query_count > 0 ? m->mrr_sum / m->query_count : 0.0,
+               m->query_count > 0 ? (double)m->total_candidates / m->query_count : 0.0,
+               m->max_candidates);
+    }
+    printf("==========================================================================\n");
+    fflush(stdout);
+
+    write_unified_eval_csv(metrics, 3);
+    free(input);
+    free(output);
+    free(queries);
 }
 
 static void evaluate_context_model(BackpropTrainer *trainer,
@@ -1591,6 +1878,9 @@ int main(int argc, char *argv[]) {
                     const char *gpu_eval_only = getenv("GPU_EVAL_ONLY");
                     if (gpu_eval_only && strcmp(gpu_eval_only, "1") == 0) {
                         fprintf(stderr, "[main] GPU_EVAL_ONLY enabled\n");
+                        run_unified_candidate_evaluation(
+                            trainer, test_chain, train_graph, rel_reg, 100,
+                            pos_thresh, (uint64_t)trans_thresh);
                         if (run_gpu_evaluation_only(test_chain, train_graph, rel_reg, 100) != 0)
                             fprintf(stderr, "[main] GPU evaluation failed\n");
                         run_neural_evaluation_only(trainer, test_chain, 100);
@@ -1608,6 +1898,10 @@ int main(int argc, char *argv[]) {
                         metrics.epochs = training_epochs;
                         metrics.seed = (int)seed;
                         metrics.gpu_count = eval_cuda_device_count();
+
+                        run_unified_candidate_evaluation(
+                            trainer, test_chain, train_graph, rel_reg, 100,
+                            pos_thresh, (uint64_t)trans_thresh);
 
                         // Evaluate based on candidate mode selection
                         evaluate_context_model(trainer, test_chain, train_graph, rel_reg, cand_mode, 100,
