@@ -237,6 +237,13 @@ static void allocate_state(DeviceState *state, int device,
 }
 
 static void free_state(DeviceState *state) {
+    fprintf(stderr, "[CUDA cleanup] begin device=%d host buffers=%p,%p,%p,%p,%p\n",
+            state->device,
+            (void *)state->host_grad_ih,
+            (void *)state->host_grad_ho,
+            (void *)state->host_grad_bias_h,
+            (void *)state->host_grad_bias_o,
+            (void *)state->host_grad_embeddings);
     cudaSetDevice(state->device);
     cudaFree(state->word_ids); cudaFree(state->embeddings);
     cudaFree(state->role_ids);
@@ -249,6 +256,7 @@ static void free_state(DeviceState *state) {
     free(state->host_grad_ih); free(state->host_grad_ho);
     free(state->host_grad_bias_h); free(state->host_grad_bias_o);
     free(state->host_grad_embeddings);
+    fprintf(stderr, "[CUDA cleanup] finished device=%d\n", state->device);
 }
 
 extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
@@ -364,7 +372,10 @@ extern "C" int backprop_train_cuda(BackpropTrainer *trainer,
         }
     }
 
+    fprintf(stderr, "[CUDA cleanup] releasing %d device states\n", gpu_count);
     for (int g = 0; g < gpu_count; g++) free_state(&states[g]);
+    fprintf(stderr, "[CUDA cleanup] releasing host training buffers\n");
     free(states); free(word_ids); free(role_ids); free(sum_ih); free(sum_ho); free(sum_bh); free(sum_bo); free(sum_embeddings);
+    fprintf(stderr, "[CUDA cleanup] training cleanup complete\n");
     return 0;
 }
