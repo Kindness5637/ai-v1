@@ -154,9 +154,16 @@ __global__ static void train_kernel(
             input_error += error_h[h] * weights_ih[i * hidden_size + h];
             atomic_add_double(&grad_ih[i * hidden_size + h], error_h[h] * input[i]);
         }
-        int source_word = i < embed_dim ? word_a : word_b;
-        int dimension = i < embed_dim ? i : i - embed_dim;
-        atomic_add_double(&grad_embeddings[source_word * embed_dim + dimension], input_error);
+        /* Only the embedding portions of the input map back into the
+         * embedding table. The remaining TRIANGLE_ROLE_FEATURE_DIM values
+         * are one-hot role features and must not be interpreted as embedding
+         * dimensions. Doing so indexed past each word's embedding and
+         * corrupted device memory during CUDA training. */
+        if (i < embed_dim) {
+            atomic_add_double(&grad_embeddings[word_a * embed_dim + i], input_error);
+        } else if (i < 2 * embed_dim) {
+            atomic_add_double(&grad_embeddings[word_b * embed_dim + (i - embed_dim)], input_error);
+        }
     }
 
     for (int o = target_start; o < target_start + embed_dim; o++) {
