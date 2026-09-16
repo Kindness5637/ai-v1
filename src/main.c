@@ -66,6 +66,34 @@ static int cmp_size_t(const void *a, const void *b) {
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 
+/* Per-query diagnostic record for the unified evaluator.
+   Modes: 0=EXACT, 1=STRUCT, 2=UNION. rank[] is the 0-based rank of the
+   gold target among that mode's candidates by the current scorer, or -1
+   when the gold is absent from the candidate set. */
+typedef struct {
+    int first_id;
+    int second_id;
+    int rotation;
+    int target_id;
+    int count[3];
+    int gold_in[3];
+    int rank[3];
+    int struct_gold_eligible; /* gold passed pos+trans thresholds (may be truncated) */
+    int struct_gold_past_cap; /* eligible but dropped by the candidate buffer cap */
+} UnifiedQueryRecord;
+
+typedef struct {
+    int found;
+    int top1;
+    int top5;
+    double mrr_sum;
+} BucketModeStats;
+
+typedef struct {
+    int queries;
+    BucketModeStats mode[3];
+} BucketStats;
+
 typedef struct {
     int from_word_id;
     int to_word_id;
@@ -389,8 +417,13 @@ static size_t collect_structural_vocab_candidates(const RelationalRegistry *rel_
                                                   double position_threshold,
                                                   uint64_t transition_threshold,
                                                   ContextCandidate *candidates,
-                                                  size_t max_candidates) {
+                                                  size_t max_candidates,
+                                                  int gold_target_id,
+                                                  int *out_gold_eligible,
+                                                  int *out_gold_past_cap) {
     if (!rel_reg || !candidates || max_candidates == 0) return 0;
+    if (out_gold_eligible) *out_gold_eligible = 0;
+    if (out_gold_past_cap) *out_gold_past_cap = 0;
 
     size_t count = 0;
     for (size_t word = 1; word <= rel_reg->vocab_size; word++) {
@@ -412,6 +445,18 @@ static size_t collect_structural_vocab_candidates(const RelationalRegistry *rel_
         uint64_t transition_count = threshold_transition_count_lookup(
             rel_reg, lookup, &query, (int)word);
         if (transition_count < transition_threshold) continue;
+
+        /* Eligibility diagnostic: gold passed both thresholds even if the
+           candidate buffer later truncates it. Distinguishes "generator
+           cannot identify gold" from "generator found too many options
+           and the cap discarded gold". */
+        if (gold_target_id > 0 && (int)word == gold_target_id) {
+            if (out_gold_eligible) *out_gold_eligible = 1;
+            if (count >= max_candidates && out_gold_past_cap)
+                *out_gold_past_cap = 1;
+        }
+
+        if (count >= max_candidates) break;
 
         double transition_strength = log1p((double)transition_count);
         double transition_compat = transition_strength / (1.0 + transition_strength);
@@ -617,7 +662,9 @@ static size_t collect_unified_candidates(const ContextGraph *graph,
                                          double position_threshold,
                                          uint64_t transition_threshold,
                                          ContextCandidate *candidates,
-                                         size_t max_candidates) {
+                                         size_t max_candidates,
+                                         int *out_struct_gold_eligible,
+                                         int *out_struct_gold_past_cap) {
     if (!graph || !query || !candidates || max_candidates == 0) return 0;
 
     if (mode == 0) {
@@ -630,7 +677,9 @@ static size_t collect_unified_candidates(const ContextGraph *graph,
         return collect_structural_vocab_candidates(
             rel_reg, lookup, query->first_id, query->second_id,
             query->target_position, position_threshold,
-            transition_threshold, candidates, max_candidates);
+            transition_threshold, candidates, max_candidates,
+            query->target_id, out_struct_gold_eligible,
+            out_struct_gold_past_cap);
     }
 
     ContextCandidate structural[1024];
@@ -640,7 +689,9 @@ static size_t collect_unified_candidates(const ContextGraph *graph,
     size_t structural_count = collect_structural_vocab_candidates(
         rel_reg, lookup, query->first_id, query->second_id,
         query->target_position, position_threshold,
-        transition_threshold, structural, 1024);
+        transition_threshold, structural, 1024,
+        query->target_id, out_struct_gold_eligible,
+        out_struct_gold_past_cap);
     return merge_candidate_sets(candidates, exact_count, structural,
                                 structural_count, max_candidates);
 }
@@ -666,6 +717,34 @@ static void write_unified_eval_csv(const UnifiedEvalMetrics *metrics,
                 m->median_candidates,
                 m->cap_hit_queries,
                 m->query_count > 0 ? (double)m->cap_hit_queries / m->query_count : 0.0);
+    }
+    fclose(f);
+}
+
+/* Per-query artifact so partitions can be re-sliced without re-training. */
+static void write_unified_query_csv(const UnifiedQueryRecord *records,
+                                    size_t query_count,
+                                    double position_threshold,
+                                    uint64_t transition_threshold) {
+    mkdir("results", 0755);
+    FILE *f = fopen("results/unified_eval_queries.csv", "w");
+    if (!f) {
+        fprintf(stderr, "[main] could not open results/unified_eval_queries.csv\n");
+        return;
+    }
+    fprintf(f, "first_id,second_id,rotation,target_id,pos_threshold,trans_threshold,"
+               "exact_count,struct_count,union_count,gold_in_exact,gold_in_struct,"
+               "gold_in_union,exact_rank,struct_rank,union_rank,"
+               "struct_gold_eligible,struct_gold_past_cap\n");
+    for (size_t q = 0; q < query_count; q++) {
+        const UnifiedQueryRecord *r = &records[q];
+        fprintf(f, "%d,%d,%d,%d,%.2f,%llu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                r->first_id, r->second_id, r->rotation, r->target_id,
+                position_threshold, (unsigned long long)transition_threshold,
+                r->count[0], r->count[1], r->count[2],
+                r->gold_in[0], r->gold_in[1], r->gold_in[2],
+                r->rank[0], r->rank[1], r->rank[2],
+                r->struct_gold_eligible, r->struct_gold_past_cap);
     }
     fclose(f);
 }
@@ -718,9 +797,19 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
         }
     }
 
+    UnifiedQueryRecord *records = calloc(query_count ? query_count : 1,
+                                         sizeof(*records));
+    BucketStats buckets[4];
+    memset(buckets, 0, sizeof(buckets));
+    int mv_total = 0, mv_from_exact = 0, mv_improved = 0, mv_unchanged = 0;
+    int mv_worsened = 0, mv_out_top5 = 0, mv_lost_rank1 = 0;
+    int elig_gold_eligible = 0, elig_gold_retained = 0, elig_gold_past_cap = 0;
+
     double *input = calloc(trainer->network->input_size, sizeof(double));
     double *output = calloc(trainer->network->output_size, sizeof(double));
-    if (!input || !output) {
+    if (!input || !output || !records) {
+        fprintf(stderr, "[main] unified eval: alloc failed (records/input/output)\n");
+        free(records);
         free(input);
         free(output);
         free(queries);
@@ -750,11 +839,23 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
         fill_model_input(input, 1, query->second_id, 0, trainer->network);
         backprop_predict(mutable_trainer, input, output);
 
+        UnifiedQueryRecord *rec = &records[q];
+        rec->first_id = query->first_id;
+        rec->second_id = query->second_id;
+        rec->rotation = query->rotation;
+        rec->target_id = query->target_id;
+        int struct_gold_eligible = 0;
+        int struct_gold_past_cap = 0;
+
         for (int mode = 0; mode < 3; mode++) {
             ContextCandidate candidates[1024];
             size_t count = collect_unified_candidates(
                 graph, rel_reg, lookup, query, mode, position_threshold,
-                transition_threshold, candidates, max_candidates);
+                transition_threshold, candidates, max_candidates,
+                &struct_gold_eligible, &struct_gold_past_cap);
+            rec->count[mode] = (int)count;
+            rec->gold_in[mode] = 0;
+            rec->rank[mode] = -1;
 
             metrics[mode].total_candidates += count;
             if (count > 0) metrics[mode].nonempty_queries++;
@@ -790,18 +891,64 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
                 }
             }
 
+            rec->gold_in[mode] = found ? 1 : 0;
+            int rank = -1;
+            if (found) {
+                rank = 0;
+                for (size_t c = 0; c < count; c++) {
+                    int candidate_id = candidates[c].word_id;
+                    if (candidate_id <= 0 || candidate_id > vocab_size) continue;
+                    if (candidates[c].match_score > target_score) rank++;
+                }
+                rec->rank[mode] = rank;
+            }
             if (!found) continue;
             metrics[mode].candidate_hits++;
-            int rank = 0;
-            for (size_t c = 0; c < count; c++) {
-                int candidate_id = candidates[c].word_id;
-                if (candidate_id <= 0 || candidate_id > vocab_size) continue;
-                if (candidates[c].match_score > target_score) rank++;
-            }
             if (rank == 0) metrics[mode].top1++;
             if (rank < 5) metrics[mode].top5++;
             metrics[mode].mrr_sum += 1.0 / (rank + 1);
         }
+
+        /* Partition by where gold lives (EXACT vs STRUCT coverage):
+           A = gold only in EXACT, B = gold only in STRUCT,
+           C = gold in both, D = gold in neither. */
+        int bucket;
+        if (rec->gold_in[0] && rec->gold_in[1]) bucket = 2;
+        else if (rec->gold_in[0]) bucket = 0;
+        else if (rec->gold_in[1]) bucket = 1;
+        else bucket = 3;
+        buckets[bucket].queries++;
+        for (int mode = 0; mode < 3; mode++) {
+            BucketModeStats *bs = &buckets[bucket].mode[mode];
+            if (!rec->gold_in[mode]) continue;
+            bs->found++;
+            if (rec->rank[mode] == 0) bs->top1++;
+            if (rec->rank[mode] >= 0 && rec->rank[mode] < 5) bs->top5++;
+            if (rec->rank[mode] >= 0)
+                bs->mrr_sum += 1.0 / (rec->rank[mode] + 1);
+        }
+
+        /* Rank movement STRUCT -> UNION (answers: does adding exact
+           candidates push gold down the ranking?) */
+        if (rec->gold_in[2]) {
+            mv_total++;
+            if (!rec->gold_in[1]) {
+                mv_from_exact++;
+            } else if (rec->rank[2] < rec->rank[1]) {
+                mv_improved++;
+            } else if (rec->rank[2] == rec->rank[1]) {
+                mv_unchanged++;
+            } else {
+                mv_worsened++;
+                if (rec->rank[1] < 5 && rec->rank[2] >= 5) mv_out_top5++;
+                if (rec->rank[1] == 0 && rec->rank[2] > 0) mv_lost_rank1++;
+            }
+        }
+
+        /* STRUCT eligibility vs retention (censoring audit) */
+        if (struct_gold_eligible) elig_gold_eligible++;
+        if (rec->gold_in[1]) elig_gold_retained++;
+        if (struct_gold_past_cap) elig_gold_past_cap++;
     }
 
     fprintf(stderr, "[main] unified evaluation progress: %zu / %zu queries\n",
@@ -854,10 +1001,55 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
                m->query_count > 0 ? 100.0 * m->cap_hit_queries / m->query_count : 0.0);
     }
     printf("==========================================================================\n");
+
+    static const char *bucket_names[4] = {
+        "A: EXACT-only", "B: STRUCT-only", "C: EXACT+STRUCT", "D: neither"
+    };
+    printf("\n=== Per-Query Gold Composition (%zu queries, pos>=%.2f trans>=%llu) ===\n",
+           query_count, position_threshold, (unsigned long long)transition_threshold);
+    printf("%-16s %-8s %-22s %-22s %-22s\n",
+           "Bucket", "Queries", "EXACT h/t1/t5/mrr", "STRUCT h/t1/t5/mrr",
+           "UNION h/t1/t5/mrr");
+    printf("----------------------------------------------------------------------------------------------\n");
+    for (int b = 0; b < 4; b++) {
+        printf("%-16s %-8d", bucket_names[b], buckets[b].queries);
+        for (int mode = 0; mode < 3; mode++) {
+            BucketModeStats *bs = &buckets[b].mode[mode];
+            int n = buckets[b].queries;
+            printf(" %d/%.1f%%/%.1f%%/%.4f",
+                   bs->found,
+                   n > 0 ? 100.0 * bs->top1 / n : 0.0,
+                   n > 0 ? 100.0 * bs->top5 / n : 0.0,
+                   n > 0 ? bs->mrr_sum / n : 0.0);
+        }
+        printf("\n");
+    }
+    printf("  (h = gold present in that mode's candidates; rates over bucket size)\n");
+
+    printf("\n=== Rank Movement: STRUCT -> UNION (gold in UNION: %d) ===\n", mv_total);
+    printf("  STRUCT missed gold, added via EXACT side : %d\n", mv_from_exact);
+    printf("  rank improved                            : %d\n", mv_improved);
+    printf("  rank unchanged                           : %d\n", mv_unchanged);
+    printf("  rank worsened                            : %d (out of top-5: %d, lost rank-1: %d)\n",
+           mv_worsened, mv_out_top5, mv_lost_rank1);
+
+    printf("\n=== STRUCT Eligibility vs Retention (censoring audit) ===\n");
+    printf("  gold eligible under thresholds (incl. truncated): %d\n",
+           elig_gold_eligible);
+    printf("  gold retained in STRUCT candidates              : %d\n",
+           elig_gold_retained);
+    printf("  gold eligible but DROPPED by %d cap             : %d\n",
+           max_candidates, elig_gold_past_cap);
+    printf("  gold not eligible under thresholds              : %d\n",
+           (int)query_count - elig_gold_eligible);
+    printf("==========================================================================\n");
     fflush(stdout);
 
     write_unified_eval_csv(metrics, 3);
+    write_unified_query_csv(records, query_count, position_threshold,
+                            transition_threshold);
     for (int mode = 0; mode < 3; mode++) free(metrics[mode].cand_counts);
+    free(records);
     transition_lookup_free(lookup);
     free(input);
     free(output);
