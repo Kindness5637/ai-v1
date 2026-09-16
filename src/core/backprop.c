@@ -349,6 +349,7 @@ void backprop_save_model(const BackpropTrainer *trainer, const char *filename) {
 
     fclose(f);
     printf("Model saved to %s\n", filename);
+    fflush(stdout);
 }
 
 BackpropTrainer *backprop_load_model(const char *filename) {

@@ -1315,16 +1315,26 @@ int main(int argc, char *argv[]) {
                         printf("CUDA training unavailable or failed. Falling back to CPU backprop_train...\n");
                         backprop_train(trainer, train_chain);
                     }
+                    fprintf(stderr, "[main] training returned\n");
                     backprop_save_model(trainer, "backprop_model_heldout.bin");
+                    fprintf(stderr, "[main] model save returned\n");
                     ContextGraph *train_graph = context_graph_create(train_chain);
+                    fprintf(stderr, "[main] context graph construction returned\n");
                     evaluate_context_model(trainer, test_chain, train_graph, rel_reg, use_mode_b, 100);
+                    fprintf(stderr, "[main] context evaluation returned\n");
                     context_graph_free(train_graph);
+                    fprintf(stderr, "[main] context graph free returned\n");
                     backprop_free(trainer);
+                    fprintf(stderr, "[main] trainer free returned\n");
                 }
                 if (rel_reg) relational_registry_free(rel_reg);
+                fprintf(stderr, "[main] relational registry free returned\n");
                 free_triangles(train_chain);
+                fprintf(stderr, "[main] train chain free returned\n");
                 free_triangles(test_chain);
+                fprintf(stderr, "[main] test chain free returned\n");
                 vocab_free(shared_vocab);
+                fprintf(stderr, "[main] shared vocabulary free returned\n");
             }
         }
 
