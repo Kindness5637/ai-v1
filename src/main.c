@@ -58,6 +58,19 @@ typedef struct {
     int max_candidates;
 } UnifiedEvalMetrics;
 
+typedef struct {
+    int from_word_id;
+    int to_word_id;
+    int transition_type;
+    uint64_t count;
+    int used;
+} TransitionLookupEntry;
+
+typedef struct {
+    TransitionLookupEntry *entries;
+    size_t capacity;
+} TransitionLookup;
+
 static void write_baseline_report(const BaselineMetrics *m) {
     mkdir("results", 0755);
     FILE *f = fopen("results/baseline_report.txt", "w");
@@ -196,6 +209,80 @@ static int has_conllu_suffix(const char *filename) {
     return length >= 7 && strcmp(filename + length - 7, ".conllu") == 0;
 }
 
+static uint64_t transition_hash(int from_id, int to_id, int transition_type) {
+    uint64_t x = (uint64_t)(unsigned int)from_id;
+    x = x * 1000003ULL ^ (uint64_t)(unsigned int)to_id;
+    x = x * 1000033ULL ^ (uint64_t)(unsigned int)transition_type;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+static TransitionLookup *transition_lookup_create(const RelationalRegistry *rel_reg) {
+    if (!rel_reg) return NULL;
+
+    size_t capacity = 1;
+    size_t needed = rel_reg->transition_count * 2 + 1;
+    while (capacity < needed) capacity <<= 1;
+
+    TransitionLookup *lookup = calloc(1, sizeof(*lookup));
+    if (!lookup) return NULL;
+    lookup->entries = calloc(capacity, sizeof(*lookup->entries));
+    if (!lookup->entries) {
+        free(lookup);
+        return NULL;
+    }
+    lookup->capacity = capacity;
+
+    for (size_t i = 0; i < rel_reg->transition_count; i++) {
+        const RelationalTransition *tr = &rel_reg->transitions[i];
+        size_t mask = lookup->capacity - 1;
+        size_t slot = (size_t)transition_hash(
+            tr->from_word_id, tr->to_word_id, tr->transition_type) & mask;
+        while (lookup->entries[slot].used) {
+            slot = (slot + 1) & mask;
+        }
+        lookup->entries[slot] = (TransitionLookupEntry){
+            tr->from_word_id,
+            tr->to_word_id,
+            tr->transition_type,
+            tr->count,
+            1
+        };
+    }
+
+    return lookup;
+}
+
+static void transition_lookup_free(TransitionLookup *lookup) {
+    if (!lookup) return;
+    free(lookup->entries);
+    free(lookup);
+}
+
+static uint64_t transition_lookup_get(const TransitionLookup *lookup,
+                                      int from_id,
+                                      int to_id,
+                                      int transition_type) {
+    if (!lookup || !lookup->entries || lookup->capacity == 0) return 0;
+
+    size_t mask = lookup->capacity - 1;
+    size_t slot = (size_t)transition_hash(from_id, to_id, transition_type) & mask;
+    while (lookup->entries[slot].used) {
+        const TransitionLookupEntry *entry = &lookup->entries[slot];
+        if (entry->from_word_id == from_id &&
+            entry->to_word_id == to_id &&
+            entry->transition_type == transition_type) {
+            return entry->count;
+        }
+        slot = (slot + 1) & mask;
+    }
+    return 0;
+}
+
 static uint64_t threshold_transition_count(const RelationalRegistry *rel_reg,
                                            const ThresholdSweepQuery *query,
                                            int candidate_id) {
@@ -217,6 +304,28 @@ static uint64_t threshold_transition_count(const RelationalRegistry *rel_reg,
             rel_reg, query->second_id, candidate_id, 0);
         backward = relational_registry_get_transition_count(
             rel_reg, candidate_id, query->second_id, 3);
+    }
+    return forward + backward;
+}
+
+static uint64_t threshold_transition_count_lookup(const RelationalRegistry *rel_reg,
+                                                  const TransitionLookup *lookup,
+                                                  const ThresholdSweepQuery *query,
+                                                  int candidate_id) {
+    if (!lookup) return threshold_transition_count(rel_reg, query, candidate_id);
+
+    int target_position = query->target_position;
+    uint64_t forward = 0;
+    uint64_t backward = 0;
+    if (target_position == 2) {
+        forward = transition_lookup_get(lookup, query->second_id, candidate_id, 1);
+        backward = transition_lookup_get(lookup, candidate_id, query->second_id, 2);
+    } else if (target_position == 0) {
+        forward = transition_lookup_get(lookup, candidate_id, query->first_id, 0);
+        backward = transition_lookup_get(lookup, query->first_id, candidate_id, 3);
+    } else {
+        forward = transition_lookup_get(lookup, query->second_id, candidate_id, 0);
+        backward = transition_lookup_get(lookup, candidate_id, query->second_id, 3);
     }
     return forward + backward;
 }
@@ -265,6 +374,7 @@ static void run_threshold_sweep_cpu(const ThresholdSweepQuery *queries,
 }
 
 static size_t collect_structural_vocab_candidates(const RelationalRegistry *rel_reg,
+                                                  const TransitionLookup *lookup,
                                                   int first_id,
                                                   int second_id,
                                                   int target_position,
@@ -291,8 +401,8 @@ static size_t collect_structural_vocab_candidates(const RelationalRegistry *rel_
         ThresholdSweepQuery query = {
             first_id, second_id, (int)word, target_position
         };
-        uint64_t transition_count = threshold_transition_count(
-            rel_reg, &query, (int)word);
+        uint64_t transition_count = threshold_transition_count_lookup(
+            rel_reg, lookup, &query, (int)word);
         if (transition_count < transition_threshold) continue;
 
         double transition_strength = log1p((double)transition_count);
@@ -493,6 +603,7 @@ static void run_neural_evaluation_only(const BackpropTrainer *trainer,
 
 static size_t collect_unified_candidates(const ContextGraph *graph,
                                          const RelationalRegistry *rel_reg,
+                                         const TransitionLookup *lookup,
                                          const EvaluationQuery *query,
                                          int mode,
                                          double position_threshold,
@@ -509,7 +620,7 @@ static size_t collect_unified_candidates(const ContextGraph *graph,
 
     if (mode == 1) {
         return collect_structural_vocab_candidates(
-            rel_reg, query->first_id, query->second_id,
+            rel_reg, lookup, query->first_id, query->second_id,
             query->target_position, position_threshold,
             transition_threshold, candidates, max_candidates);
     }
@@ -519,7 +630,7 @@ static size_t collect_unified_candidates(const ContextGraph *graph,
         graph, query->first_id, 0, query->second_id, 0,
         query->rotation, candidates, max_candidates);
     size_t structural_count = collect_structural_vocab_candidates(
-        rel_reg, query->first_id, query->second_id,
+        rel_reg, lookup, query->first_id, query->second_id,
         query->target_position, position_threshold,
         transition_threshold, structural, 1024);
     return merge_candidate_sets(candidates, exact_count, structural,
@@ -598,8 +709,20 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
     const int max_candidates = 1024;
     int embed_dim = trainer->network->embed_dim;
     BackpropTrainer *mutable_trainer = (BackpropTrainer *)trainer;
+    TransitionLookup *lookup = transition_lookup_create(rel_reg);
+
+    fprintf(stderr,
+            "[main] unified evaluation starting: %zu queries, %zu transitions\n",
+            query_count, rel_reg->transition_count);
+    fflush(stderr);
 
     for (size_t q = 0; q < query_count; q++) {
+        if (q == 0 || q % 25 == 0) {
+            fprintf(stderr, "[main] unified evaluation progress: %zu / %zu queries\n",
+                    q, query_count);
+            fflush(stderr);
+        }
+
         const EvaluationQuery *query = &queries[q];
         memset(input, 0, trainer->network->input_size * sizeof(double));
         fill_model_input(input, 0, query->first_id, 0, trainer->network);
@@ -609,7 +732,7 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
         for (int mode = 0; mode < 3; mode++) {
             ContextCandidate candidates[1024];
             size_t count = collect_unified_candidates(
-                graph, rel_reg, query, mode, position_threshold,
+                graph, rel_reg, lookup, query, mode, position_threshold,
                 transition_threshold, candidates, max_candidates);
 
             metrics[mode].total_candidates += count;
@@ -657,6 +780,10 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
         }
     }
 
+    fprintf(stderr, "[main] unified evaluation progress: %zu / %zu queries\n",
+            query_count, query_count);
+    fflush(stderr);
+
     printf("\n=== Unified Held-out Candidate Evaluation (%zu shared queries) ===\n",
            query_count);
     printf("Thresholds: pos >= %.2f | transition >= %llu\n",
@@ -681,6 +808,7 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
     fflush(stdout);
 
     write_unified_eval_csv(metrics, 3);
+    transition_lookup_free(lookup);
     free(input);
     free(output);
     free(queries);
