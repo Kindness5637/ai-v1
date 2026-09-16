@@ -22,6 +22,8 @@ typedef struct {
     uint64_t candidates_emitted;
 } ThresholdSweepResult;
 
+int eval_cuda_device_count(void);
+
 int run_threshold_sweep_cuda(const ThresholdSweepQuery *queries,
                              size_t query_count,
                              size_t vocab_size,

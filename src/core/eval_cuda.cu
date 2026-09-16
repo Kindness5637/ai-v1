@@ -11,6 +11,13 @@ struct DeviceThresholdResult {
     unsigned long long candidates_emitted;
 };
 
+int eval_cuda_device_count(void) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess)
+        return 0;
+    return device_count;
+}
+
 static int transition_compare(const void *a, const void *b) {
     const RelationalTransition *x = (const RelationalTransition *)a;
     const RelationalTransition *y = (const RelationalTransition *)b;

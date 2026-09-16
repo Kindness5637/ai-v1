@@ -39,7 +39,9 @@ static void fill_token_features(double *input, int offset, int word_id,
     }
 }
 
-BackpropTrainer *backprop_create(int vocab_size, int embed_dim, int hidden_size, int output_size, int max_epochs, double lr) {
+BackpropTrainer *backprop_create_seeded(int vocab_size, int embed_dim, int hidden_size,
+                                        int output_size, int max_epochs, double lr,
+                                        unsigned int seed) {
     BackpropTrainer *trainer = malloc(sizeof(BackpropTrainer));
     if (!trainer) return NULL;
 
@@ -86,7 +88,7 @@ BackpropTrainer *backprop_create(int vocab_size, int embed_dim, int hidden_size,
         return NULL;
     }
 
-    srand(time(NULL));
+    srand(seed);
     double embed_scale = 1.0 / sqrt(embed_dim);
     for (int i = 0; i < vocab_size * embed_dim; i++) {
         trainer->network->embeddings[i] = (((double)rand() / RAND_MAX) * 2.0 - 1.0) * embed_scale;
@@ -105,6 +107,13 @@ BackpropTrainer *backprop_create(int vocab_size, int embed_dim, int hidden_size,
     }
 
     return trainer;
+}
+
+BackpropTrainer *backprop_create(int vocab_size, int embed_dim, int hidden_size,
+                                 int output_size, int max_epochs, double lr) {
+    return backprop_create_seeded(vocab_size, embed_dim, hidden_size,
+                                  output_size, max_epochs, lr,
+                                  (unsigned int)time(NULL));
 }
 
 void backprop_free(BackpropTrainer *trainer) {

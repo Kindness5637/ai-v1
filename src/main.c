@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/stat.h>
 #include "core/triangle.h"
 #include "core/probability.h"
 #include "core/neural.h"
@@ -15,6 +16,82 @@
 #include "core/punctuation.h"
 #include "core/backprop.h"
 #include "core/eval_cuda.h"
+
+typedef struct {
+    const char *dataset_path;
+    long training_triangles;
+    long heldout_triangles;
+    int vocab_size;
+    int training_vocab;
+    int embed_dim;
+    int hidden_dim;
+    int negative_samples;
+    int epochs;
+    int seed;
+    int gpu_count;
+    const char *evaluation_mode;
+    double exact_recall;
+    double neural_top1;
+    double neural_top5;
+    double mrr;
+    double avg_candidates;
+} BaselineMetrics;
+
+static void write_baseline_report(const BaselineMetrics *m) {
+    mkdir("results", 0755);
+    FILE *f = fopen("results/baseline_report.txt", "w");
+    if (!f) return;
+
+    fprintf(f, "=== Frozen Baseline Measurement Snapshot ===\n\n");
+    fprintf(f, "Configuration & Dataset:\n");
+    fprintf(f, "  Dataset Path: %s\n", m->dataset_path ? m->dataset_path : "unknown");
+    fprintf(f, "  Training Triangles: %ld\n", m->training_triangles);
+    fprintf(f, "  Held-out Triangles: %ld\n", m->heldout_triangles);
+    fprintf(f, "  Vocabulary Size: %d\n", m->vocab_size);
+    fprintf(f, "  Training Vocabulary: %d\n", m->training_vocab);
+    fprintf(f, "  Embedding Dim: %d\n", m->embed_dim);
+    fprintf(f, "  Hidden Dim: %d\n", m->hidden_dim);
+    fprintf(f, "  Negative Samples: %d\n", m->negative_samples);
+    fprintf(f, "  Epochs: %d\n", m->epochs);
+    fprintf(f, "  Seed: %d\n", m->seed);
+    fprintf(f, "  GPU Count: %d\n\n", m->gpu_count);
+    fprintf(f, "Evaluation Metrics:\n");
+    fprintf(f, "  Evaluation Mode: %s\n", m->evaluation_mode ? m->evaluation_mode : "EXACT");
+    fprintf(f, "  Exact Candidate Recall: %.2f%%\n", m->exact_recall);
+    fprintf(f, "  Neural Top-1 Accuracy: %.2f%%\n", m->neural_top1);
+    fprintf(f, "  Neural Top-5 Accuracy: %.2f%%\n", m->neural_top5);
+    fprintf(f, "  Mean Reciprocal Rank (MRR): %.4f\n", m->mrr);
+    fprintf(f, "  Avg Candidates / Known Pair: %.2f\n", m->avg_candidates);
+    fclose(f);
+}
+
+static void write_metrics_csv(const BaselineMetrics *m) {
+    mkdir("results", 0755);
+    FILE *f = fopen("results/metrics.csv", "w");
+    if (!f) return;
+
+    fprintf(f, "dataset_path,training_triangles,heldout_triangles,vocab_size,training_vocab,embed_dim,hidden_dim,negative_samples,epochs,seed,gpu_count,evaluation_mode,exact_recall,neural_top1,neural_top5,mrr,avg_candidates\n");
+    fprintf(f, "\"%s\",%ld,%ld,%d,%d,%d,%d,%d,%d,%d,%d,\"%s\",%.2f,%.2f,%.2f,%.4f,%.2f\n",
+            m->dataset_path ? m->dataset_path : "",
+            m->training_triangles,
+            m->heldout_triangles,
+            m->vocab_size,
+            m->training_vocab,
+            m->embed_dim,
+            m->hidden_dim,
+            m->negative_samples,
+            m->epochs,
+            m->seed,
+            m->gpu_count,
+            m->evaluation_mode ? m->evaluation_mode : "EXACT",
+            m->exact_recall,
+            m->neural_top1,
+            m->neural_top5,
+            m->mrr,
+            m->avg_candidates);
+    fclose(f);
+}
+
 
 char *read_file(const char *filename) {
     FILE *file = fopen(filename, "r");
@@ -52,6 +129,7 @@ void print_usage(void) {
     printf("  ./triangle.out <file> -predict <a> <b> - Rank graph candidates neurally\n");
     printf("  ./triangle.out <file> -evaluate-context [n] - Evaluate rotations\n");
     printf("  ./triangle.out <train> -heldout <test> [train2 ...] - Multi-document held-out experiment\n");
+    printf("      --cand-mode exact|struct|union --pos-thresh <x> --trans-thresh <n> --seed <n>\n");
     printf("  ./triangle.out <old> -learn <new>  - Learn from new text using old as base\n");
     printf("  ./triangle.out <file> -backprop    - Train with backpropagation\n");
     printf("  .conllu files use FORM, UPOS, and DEPREL role metadata\n");
@@ -325,8 +403,11 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                                    const TriangleChain *chain,
                                    const ContextGraph *graph,
                                    const RelationalRegistry *rel_reg,
-                                   int use_mode_b,
-                                   size_t limit) {
+                                   int candidate_mode,
+                                   size_t limit,
+                                   double position_threshold,
+                                   uint64_t transition_threshold,
+                                   BaselineMetrics *out_metrics) {
     if (!graph) {
         printf("Unable to create evaluation context graph.\n");
         return;
@@ -335,6 +416,8 @@ static void evaluate_context_model(BackpropTrainer *trainer,
     int graph_hits = 0, neural_top1 = 0, neural_top5 = 0, total = 0;
     int pair_queries = 0, ambiguous_pairs = 0, max_candidates = 0;
     size_t candidate_total = 0;
+    double mrr_sum = 0.0;
+
     int candidate_ids[256];
     int embed_dim = trainer->network->embed_dim;
     double *input = calloc(trainer->network->input_size, sizeof(double));
@@ -345,18 +428,41 @@ static void evaluate_context_model(BackpropTrainer *trainer,
             int first_id = chain->triangles[t].word_ids[rotation];
             int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
             int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+            int use_mode_b = candidate_mode == 1;
             int first_role = use_mode_b ? 0 : chain->triangles[t].role_ids[rotation];
             int second_role = use_mode_b ? 0 : chain->triangles[t].role_ids[(rotation + 1) % 3];
 
             ContextCandidate evidence[256];
             size_t count = 0;
-            if (use_mode_b) {
-                count = context_graph_collect_candidate_evidence_relational(
-                    graph, rel_reg, first_id, second_id, rotation, evidence, 256);
-            } else {
+            if (candidate_mode == 1) {
+                count = context_graph_collect_candidate_evidence_relational_thresholded(
+                    graph, rel_reg, first_id, second_id, rotation,
+                    position_threshold, transition_threshold, evidence, 256);
+            } else if (candidate_mode == 0) {
                 count = context_graph_collect_candidate_evidence_fallback(
                     graph, first_id, first_role, second_id, second_role, rotation,
                     evidence, 256);
+            } else {
+                ContextCandidate structural[256];
+                size_t exact_count = context_graph_collect_candidate_evidence_fallback(
+                    graph, first_id, first_role, second_id, second_role, rotation,
+                    evidence, 256);
+                size_t structural_count = context_graph_collect_candidate_evidence_relational_thresholded(
+                    graph, rel_reg, first_id, second_id, rotation,
+                    position_threshold, transition_threshold, structural, 256);
+                count = exact_count;
+                for (size_t s = 0; s < structural_count && count < 256; s++) {
+                    int duplicate = 0;
+                    for (size_t e = 0; e < count; e++) {
+                        if (evidence[e].word_id == structural[s].word_id) {
+                            if (structural[s].match_score > evidence[e].match_score)
+                                evidence[e].match_score = structural[s].match_score;
+                            duplicate = 1;
+                            break;
+                        }
+                    }
+                    if (!duplicate) evidence[count++] = structural[s];
+                }
             }
             total++;
             if (count == 0) continue;
@@ -387,7 +493,7 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                 double base_score = -distance +
                     0.75 * log(1.0 + occurrence) +
                     0.50 * log(1.0 + neighbors);
-                if (use_mode_b) {
+                if (candidate_mode == 1) {
                     scores[c] = base_score * (0.5 + match_score);
                 } else {
                     scores[c] = base_score + match_score;
@@ -405,11 +511,23 @@ static void evaluate_context_model(BackpropTrainer *trainer,
                 graph_hits++;
                 neural_top1 += rank == 0;
                 neural_top5 += rank < 5;
+                mrr_sum += 1.0 / (rank + 1);
             }
         }
     }
 
-    if (use_mode_b && rel_reg && pair_queries > 0) {
+    if (out_metrics) {
+        out_metrics->evaluation_mode = candidate_mode == 1 ? "STRUCTURAL" :
+                                       candidate_mode == 2 ? "UNION" : "EXACT";
+        out_metrics->exact_recall = total > 0 ? 100.0 * graph_hits / total : 0.0;
+        out_metrics->neural_top1 = total > 0 ? 100.0 * neural_top1 / total : 0.0;
+        out_metrics->neural_top5 = total > 0 ? 100.0 * neural_top5 / total : 0.0;
+        out_metrics->mrr = total > 0 ? mrr_sum / total : 0.0;
+        out_metrics->avg_candidates = pair_queries > 0 ? (double)candidate_total / pair_queries : 0.0;
+    }
+
+
+    if (candidate_mode == 1 && rel_reg && pair_queries > 0) {
         double thresholds[7] = {0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30};
         printf("\n=== Phase 2B Positional Filter Diagnostic Sweep ===\n");
         printf("%-10s %-18s %-24s %-14s\n", "Threshold", "Avg Remaining Cand", "Cond Gold Retention", "Reduction");
@@ -937,6 +1055,28 @@ int main(int argc, char *argv[]) {
     const char *filename = argv[1];
     char *file_content = NULL;
 
+    // New command-line options
+    int cand_mode = 2; // 0=exact,1=struct,2=union (default)
+    double pos_thresh = 0.25;
+    int trans_thresh = 3;
+    unsigned int seed = 42;
+    // Manual long option parsing
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "--cand-mode") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "exact") == 0) cand_mode = 0;
+            else if (strcmp(mode, "struct") == 0) cand_mode = 1;
+            else if (strcmp(mode, "union") == 0) cand_mode = 2;
+        } else if (strcmp(argv[i], "--pos-thresh") == 0 && i + 1 < argc) {
+            pos_thresh = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--trans-thresh") == 0 && i + 1 < argc) {
+            trans_thresh = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = (unsigned int)atoi(argv[++i]);
+        }
+    }
+    srand(seed);
+
     FILE *f = fopen(filename, "r");
     if (f) {
         fclose(f);
@@ -1276,92 +1416,49 @@ int main(int argc, char *argv[]) {
             backprop_free(trainer);
             context_graph_free(context_graph);
         } else {
-            int graph_hits = 0;
-            int neural_top1 = 0;
-            int neural_top5 = 0;
-            int total = 0;
-            int candidate_ids[256];
-            int embed_dim = trainer->network->embed_dim;
-            double *input = calloc(trainer->network->input_size, sizeof(double));
-            double *output = calloc(trainer->network->output_size, sizeof(double));
+            RelationalRegistry *eval_reg = relational_registry_create(chain->vocab->count);
+            if (eval_reg) relational_registry_ingest_chain(eval_reg, chain);
+            BaselineMetrics metrics = {0};
+            metrics.dataset_path = filename;
+            metrics.training_triangles = (long)chain->count;
+            metrics.heldout_triangles = 0;
+            metrics.vocab_size = (int)chain->vocab->count;
+            metrics.training_vocab = (int)chain->vocab->count;
+            metrics.embed_dim = trainer->network->embed_dim;
+            metrics.hidden_dim = trainer->network->hidden_size;
 
-            for (size_t t = 0; t < limit; t++) {
-                for (int rotation = 0; rotation < 3; rotation++) {
-                    int first_id = chain->triangles[t].word_ids[rotation];
-                    int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
-                    int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
-                    size_t candidate_count = context_graph_collect_candidates(
-                        context_graph, first_id, second_id, candidate_ids, 256);
-                    if (candidate_count == 0) continue;
-                    total++;
-                    ContextCandidate evidence[256];
-                    size_t evidence_count = context_graph_collect_candidate_evidence(
-                        context_graph, first_id, second_id, evidence, 256);
-                    double candidate_scores[256];
-                    double target_score = -INFINITY;
-                    fill_model_input(input, 0, first_id,
-                                     chain->triangles[t].role_ids[rotation], trainer->network);
-                    fill_model_input(input, 1, second_id,
-                                     chain->triangles[t].role_ids[(rotation + 1) % 3], trainer->network);
-                    backprop_predict(trainer, input, output);
-                    for (size_t c = 0; c < candidate_count; c++) {
-                        double distance = 0.0;
-                        for (int d = 0; d < embed_dim; d++) {
-                            double delta = output[2 * embed_dim + d] -
-                                trainer->network->embeddings[(candidate_ids[c] - 1) * embed_dim + d];
-                            distance += delta * delta;
-                        }
-                        int occurrence = 0;
-                        int neighbors = 0;
-                        for (size_t e = 0; e < evidence_count; e++) {
-                            if (evidence[e].word_id == candidate_ids[c]) {
-                                occurrence = evidence[e].occurrence_count;
-                                neighbors = evidence[e].neighbor_count;
-                                break;
-                            }
-                        }
-                        candidate_scores[c] = -distance +
-                            0.75 * log(1.0 + occurrence) +
-                            0.50 * log(1.0 + neighbors);
-                        if (candidate_ids[c] == target_id) target_score = candidate_scores[c];
-                    }
-                    int found = 0;
-                    for (size_t c = 0; c < candidate_count; c++) {
-                        if (candidate_ids[c] == target_id) found = 1;
-                    }
-                    int target_rank = 0;
-                    if (found) {
-                        for (size_t c = 0; c < candidate_count; c++) {
-                            if (candidate_scores[c] > target_score) target_rank++;
-                        }
-                    }
-                    graph_hits += found;
-                    neural_top1 += found && target_rank == 0;
-                    neural_top5 += found && target_rank < 5;
-                }
+            metrics.negative_samples = 32;
+            metrics.epochs = 50;
+            metrics.seed = (int)seed;
+            metrics.gpu_count = eval_cuda_device_count();
+
+            if (cand_mode != 0 && eval_reg) {
+                evaluate_context_model(trainer, chain, context_graph, eval_reg, cand_mode, limit,
+                                       pos_thresh, (uint64_t)trans_thresh, &metrics);
+            } else {
+                evaluate_context_model(trainer, chain, context_graph, NULL, 0, limit,
+                                       pos_thresh, (uint64_t)trans_thresh, &metrics);
             }
-            printf("\n=== Context Evaluation (%zu triangles) ===\n", limit);
-            printf("Rotation queries: %d\n", total);
-            if (total > 0) {
-                printf("Graph recall: %.1f%%\n", 100.0 * graph_hits / total);
-                printf("Neural top-1: %.1f%%\n", 100.0 * neural_top1 / total);
-                printf("Neural top-5: %.1f%%\n", 100.0 * neural_top5 / total);
-            }
-            free(input);
-            free(output);
+            write_baseline_report(&metrics);
+            write_metrics_csv(&metrics);
+
+            relational_registry_free(eval_reg);
             context_graph_free(context_graph);
             backprop_free(trainer);
         }
+
     } else if (argc > 3 && strcmp(argv[2], "-heldout") == 0) {
-        char *all_content = read_file("data/combined_all.txt");
         char *test_content = read_file(argv[3]);
-        TriangleChain *global_chain = all_content ? create_triangles(all_content) : NULL;
+        TriangleChain *global_chain = has_conllu_suffix(filename)
+            ? create_triangles_from_conllu(file_content)
+            : create_triangles(file_content);
         if (!global_chain || !test_content) {
-            fprintf(stderr, "Held-out experiment requires data/combined_all.txt and a test file\n");
+            fprintf(stderr, "Held-out experiment requires training data and a test file\n");
             free(test_content);
-            free(all_content);
             free_triangles(global_chain);
         } else {
+
+
             Vocabulary *shared_vocab = global_chain->vocab;
             global_chain->vocab = NULL;
             global_chain->owns_vocab = 0;
@@ -1370,6 +1467,7 @@ int main(int argc, char *argv[]) {
             /* Combine the primary training document with any additional
              * training documents listed after the held-out test file. */
             size_t train_size = strlen(file_content);
+            int training_documents = 1;
             char *combined_train = malloc(train_size + 1);
             if (combined_train) {
                 memcpy(combined_train, file_content, train_size);
@@ -1378,6 +1476,10 @@ int main(int argc, char *argv[]) {
             for (int arg = 4; combined_train && arg < argc; arg++) {
                 if (argv[arg][0] == '-') {
                     if (strcmp(argv[arg], "-mode") == 0 && arg + 1 < argc) arg++;
+                    else if (strcmp(argv[arg], "--cand-mode") == 0 && arg + 1 < argc) arg++;
+                    else if (strcmp(argv[arg], "--pos-thresh") == 0 && arg + 1 < argc) arg++;
+                    else if (strcmp(argv[arg], "--trans-thresh") == 0 && arg + 1 < argc) arg++;
+                    else if (strcmp(argv[arg], "--seed") == 0 && arg + 1 < argc) arg++;
                     continue;
                 }
                 char *extra_content = read_file(argv[arg]);
@@ -1403,6 +1505,7 @@ int main(int argc, char *argv[]) {
                 memcpy(combined_train + train_size + 1, extra_content, extra_size + 1);
                 train_size += 1 + extra_size;
                 free(extra_content);
+                training_documents++;
             }
 
             TriangleChain *train_chain = NULL;
@@ -1442,7 +1545,7 @@ int main(int argc, char *argv[]) {
                 printf("Training triangles: %zu\n", train_chain->count);
                 printf("Held-out triangles: %zu\n", test_chain->count);
                 printf("Shared vocabulary: %zu words\n", shared_vocab->count);
-                printf("Training documents: %d\n", argc - 3);
+                printf("Training documents: %d\n", training_documents);
 
                 if (train_chain->count == 0) {
                     fprintf(stderr,
@@ -1471,8 +1574,8 @@ int main(int argc, char *argv[]) {
                         training_epochs = (int)parsed;
                 }
                 printf("Training epochs: %d\n", training_epochs);
-                BackpropTrainer *trainer = backprop_create(
-                    (int)shared_vocab->count, 32, 128, 96, training_epochs, 0.1);
+                BackpropTrainer *trainer = backprop_create_seeded(
+                    (int)shared_vocab->count, 32, 128, 96, training_epochs, 0.1, seed);
                 if (!trainer) {
                     fprintf(stderr, "Failed to create backprop trainer\n");
                 } else {
@@ -1492,9 +1595,28 @@ int main(int argc, char *argv[]) {
                             fprintf(stderr, "[main] GPU evaluation failed\n");
                         run_neural_evaluation_only(trainer, test_chain, 100);
                     } else {
-                        evaluate_context_model(trainer, test_chain, train_graph, rel_reg, use_mode_b, 100);
+                        BaselineMetrics metrics = {0};
+                        metrics.dataset_path = filename;
+                        metrics.training_triangles = (long)train_chain->count;
+                        metrics.heldout_triangles = (long)test_chain->count;
+                        metrics.vocab_size = (int)shared_vocab->count;
+                        metrics.training_vocab = (int)shared_vocab->count;
+                        metrics.embed_dim = trainer->network->embed_dim;
+                        metrics.hidden_dim = trainer->network->hidden_size;
+
+                        metrics.negative_samples = 32;
+                        metrics.epochs = training_epochs;
+                        metrics.seed = (int)seed;
+                        metrics.gpu_count = eval_cuda_device_count();
+
+                        // Evaluate based on candidate mode selection
+                        evaluate_context_model(trainer, test_chain, train_graph, rel_reg, cand_mode, 100,
+                                               pos_thresh, (uint64_t)trans_thresh, &metrics);
+                        write_baseline_report(&metrics);
+                        write_metrics_csv(&metrics);
                         fprintf(stderr, "[main] context evaluation returned\n");
                     }
+
                     context_graph_free(train_graph);
                     fprintf(stderr, "[main] context graph free returned\n");
                     backprop_free(trainer);
@@ -1598,8 +1720,9 @@ int main(int argc, char *argv[]) {
 
         int vocab_size = (int)chain->vocab->count;
         int embed_dim = 32;
-        BackpropTrainer *trainer = backprop_create(vocab_size, embed_dim, 128,
-                                                    3 * embed_dim, 50, 0.1);
+        BackpropTrainer *trainer = backprop_create_seeded(vocab_size, embed_dim, 128,
+                                                          3 * embed_dim, 50, 0.1,
+                                                          seed);
         if (!trainer) {
             fprintf(stderr, "Failed to create trainer\n");
             free_triangles(chain);

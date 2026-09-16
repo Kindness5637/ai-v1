@@ -397,11 +397,14 @@ size_t context_graph_collect_candidate_evidence_fallback(const ContextGraph *gra
                                  1.0, candidates, count, max_candidates);
 }
 
-size_t context_graph_collect_candidate_evidence_relational(const ContextGraph *graph,
+size_t context_graph_collect_candidate_evidence_relational_thresholded(
+                                                           const ContextGraph *graph,
                                                            const RelationalRegistry *rel_reg,
                                                            int first_word_id,
                                                            int second_word_id,
                                                            int rotation,
+                                                           double position_threshold,
+                                                           uint64_t transition_threshold,
                                                            ContextCandidate *candidates,
                                                            size_t max_candidates) {
     /* Collect candidates using purely positional & directional evidence without UPOS/DEPREL */
@@ -419,6 +422,7 @@ size_t context_graph_collect_candidate_evidence_relational(const ContextGraph *g
      *   transition_compat  ∈ [0,1]  — squashed transition evidence
      *   relational_compat  ∈ [0,1]  — final gated score
      */
+    size_t kept = 0;
     for (size_t i = 0; i < count; i++) {
         int cand_id = candidates[i].word_id;
         if (cand_id <= 0 || (size_t)cand_id > rel_reg->vocab_size) continue;
@@ -469,8 +473,26 @@ size_t context_graph_collect_candidate_evidence_relational(const ContextGraph *g
         /* Gate positional ratio by transition evidence, bounded [0,1] */
         double relational_compat = pos_ratio * (0.5 + 0.5 * transition_compat);
 
-        candidates[i].match_score = relational_compat;
+        if (pos_ratio < position_threshold || fwd + bwd < transition_threshold)
+            continue;
+
+        candidates[kept] = candidates[i];
+        candidates[kept].match_score = relational_compat;
+        kept++;
     }
 
-    return count;
+    return kept;
+}
+
+size_t context_graph_collect_candidate_evidence_relational(
+                                                           const ContextGraph *graph,
+                                                           const RelationalRegistry *rel_reg,
+                                                           int first_word_id,
+                                                           int second_word_id,
+                                                           int rotation,
+                                                           ContextCandidate *candidates,
+                                                           size_t max_candidates) {
+    return context_graph_collect_candidate_evidence_relational_thresholded(
+        graph, rel_reg, first_word_id, second_word_id, rotation,
+        0.0, 0, candidates, max_candidates);
 }

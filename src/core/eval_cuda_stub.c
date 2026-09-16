@@ -1,5 +1,9 @@
 #include "eval_cuda.h"
 
+int eval_cuda_device_count(void) {
+    return 0;
+}
+
 int run_threshold_sweep_cuda(const ThresholdSweepQuery *queries,
                              size_t query_count,
                              size_t vocab_size,

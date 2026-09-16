@@ -92,5 +92,10 @@ size_t context_graph_collect_candidate_evidence_relational(const ContextGraph *g
                                                            int rotation,
                                                            ContextCandidate *candidates,
                                                            size_t max_candidates);
+size_t context_graph_collect_candidate_evidence_relational_thresholded(
+    const ContextGraph *graph, const RelationalRegistry *rel_reg,
+    int first_word_id, int second_word_id, int rotation,
+    double position_threshold, uint64_t transition_threshold,
+    ContextCandidate *candidates, size_t max_candidates);
 
 #endif
