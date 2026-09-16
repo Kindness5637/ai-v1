@@ -165,6 +165,93 @@ static void run_threshold_sweep_cpu(const ThresholdSweepQuery *queries,
     }
 }
 
+static int run_gpu_evaluation_only(const TriangleChain *chain,
+                                   const ContextGraph *graph,
+                                   const RelationalRegistry *rel_reg,
+                                   size_t limit) {
+    if (!chain || !graph || !rel_reg) return -1;
+    if (limit > chain->count) limit = chain->count;
+
+    size_t capacity = limit * 3;
+    ThresholdSweepQuery *queries = calloc(capacity ? capacity : 1,
+                                          sizeof(*queries));
+    if (!queries) return -1;
+    size_t query_count = 0;
+
+    for (size_t t = 0; t < limit; t++) {
+        for (int rotation = 0; rotation < 3; rotation++) {
+            int first_id = chain->triangles[t].word_ids[rotation];
+            int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+            int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+            if (target_id <= 0) continue;
+
+            ContextCandidate evidence[256];
+            size_t count = context_graph_collect_candidate_evidence_relational(
+                graph, rel_reg, first_id, second_id, rotation, evidence, 256);
+            if (count == 0) continue;
+
+            int target_present = 0;
+            for (size_t c = 0; c < count; c++) {
+                if (evidence[c].word_id == target_id) {
+                    target_present = 1;
+                    break;
+                }
+            }
+            if (target_present) continue;
+
+            int exact_graph_match = 0;
+            for (size_t i = 0; i < graph->node_count; i++) {
+                const ContextNode *node = &graph->nodes[i];
+                if (node->type == CONTEXT_TRIANGLE_NODE &&
+                    node->word_ids[0] == first_id &&
+                    node->word_ids[1] == second_id &&
+                    node->rotation == rotation &&
+                    node->word_ids[2] == target_id) {
+                    exact_graph_match = 1;
+                    break;
+                }
+            }
+            if (!exact_graph_match && query_count < capacity) {
+                queries[query_count++] = (ThresholdSweepQuery){
+                    first_id, second_id, target_id, (rotation + 2) % 3};
+            }
+        }
+    }
+
+    double position_thresholds[3] = {0.15, 0.25, 0.35};
+    uint64_t transition_thresholds[4] = {1, 2, 3, 6};
+    ThresholdSweepResult results[12];
+    int status = run_threshold_sweep_cuda(
+        queries, query_count, rel_reg->vocab_size, rel_reg->word_stats,
+        rel_reg->transitions, rel_reg->transition_count,
+        position_thresholds, 3, transition_thresholds, 4, results);
+    if (status != 0) {
+        free(queries);
+        return -1;
+    }
+
+    printf("\n=== GPU Evaluation Only: Threshold Sweep (%zu queries) ===\n",
+           query_count);
+    printf("%-10s %-12s %-20s %-20s %-15s\n",
+           "Pos Thresh", "Trans Cutoff", "Gold Recovered",
+           "Fully-Supp", "Avg Candidates");
+    for (int p = 0; p < 3; p++) {
+        for (int tr = 0; tr < 4; tr++) {
+            int index = p * 4 + tr;
+            printf("%-10.2f >= %-9llu %llu / %zu             %llu             %.2f\n",
+                   position_thresholds[p],
+                   (unsigned long long)transition_thresholds[tr],
+                   (unsigned long long)results[index].gold_recovered,
+                   query_count,
+                   (unsigned long long)results[index].fully_supported_recovered,
+                   query_count > 0 ? (double)results[index].candidates_emitted / query_count : 0.0);
+        }
+    }
+    fflush(stdout);
+    free(queries);
+    return 0;
+}
+
 static void evaluate_context_model(BackpropTrainer *trainer,
                                    const TriangleChain *chain,
                                    const ContextGraph *graph,
@@ -1320,8 +1407,15 @@ int main(int argc, char *argv[]) {
                     fprintf(stderr, "[main] model save returned\n");
                     ContextGraph *train_graph = context_graph_create(train_chain);
                     fprintf(stderr, "[main] context graph construction returned\n");
-                    evaluate_context_model(trainer, test_chain, train_graph, rel_reg, use_mode_b, 100);
-                    fprintf(stderr, "[main] context evaluation returned\n");
+                    const char *gpu_eval_only = getenv("GPU_EVAL_ONLY");
+                    if (gpu_eval_only && strcmp(gpu_eval_only, "1") == 0) {
+                        fprintf(stderr, "[main] GPU_EVAL_ONLY enabled\n");
+                        if (run_gpu_evaluation_only(test_chain, train_graph, rel_reg, 100) != 0)
+                            fprintf(stderr, "[main] GPU evaluation failed\n");
+                    } else {
+                        evaluate_context_model(trainer, test_chain, train_graph, rel_reg, use_mode_b, 100);
+                        fprintf(stderr, "[main] context evaluation returned\n");
+                    }
                     context_graph_free(train_graph);
                     fprintf(stderr, "[main] context graph free returned\n");
                     backprop_free(trainer);
