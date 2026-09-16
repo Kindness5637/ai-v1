@@ -1462,8 +1462,17 @@ int main(int argc, char *argv[]) {
                 }
 
 
+                int training_epochs = 50;
+                const char *epochs_env = getenv("TRAIN_EPOCHS");
+                if (epochs_env && *epochs_env) {
+                    char *end = NULL;
+                    long parsed = strtol(epochs_env, &end, 10);
+                    if (end != epochs_env && *end == '\0' && parsed > 0 && parsed <= 10000)
+                        training_epochs = (int)parsed;
+                }
+                printf("Training epochs: %d\n", training_epochs);
                 BackpropTrainer *trainer = backprop_create(
-                    (int)shared_vocab->count, 32, 128, 96, 50, 0.1);
+                    (int)shared_vocab->count, 32, 128, 96, training_epochs, 0.1);
                 if (!trainer) {
                     fprintf(stderr, "Failed to create backprop trainer\n");
                 } else {
