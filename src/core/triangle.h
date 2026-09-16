@@ -59,6 +59,44 @@ TriangleChain *create_triangles_from_conllu(const char *content);
 TriangleChain *create_triangles_from_conllu_with_vocab(const char *content,
                                                        Vocabulary *vocab);
 int triangle_role_id(const char *upos);
+
+/* Diagnostic: how much does the role (UPOS) channel tell us beyond the word
+   identity? Pure corpus statistic over the chain; no model involved.
+
+   H(role|word) is the token-weighted conditional entropy in bits. If it is
+   near zero, a token's role is derivable from its word alone, so any role
+   feature -- a one-hot bias shift, or a role-by-word interaction term -- is
+   largely redundant with the word embedding already present in the input.
+
+   How each number is computed (all base-2, probabilities from token counts):
+     tokens            = tokens carrying a NONZERO role (0 = holding/unknown)
+     marginal_entropy  = H(role) = -sum_r p(r) log2 p(r) over all such tokens
+     cond_entropy      = sum_w (n_w / tokens) * H(role | w)   [token-weighted]
+     cond_entropy_word = (1/distinct_words) * sum_w H(role | w) [word-weighted]
+     mutual_info       = marginal_entropy - cond_entropy
+
+   What this does NOT account for:
+     - Context: all occurrences of an ambiguous word are pooled, so a word that
+       is disambiguated by its neighbours still counts as fully ambiguous here.
+     - Coverage: holding tokens (role 0) are excluded, which biases H(role)
+       upward when many tokens are unknown.
+     - Usefulness: high entropy means roles are not redundant with the word;
+       it does NOT establish that a role feature would improve ranking. */
+typedef struct {
+    size_t tokens;
+    size_t distinct_words;
+    size_t deterministic_words;   /* words observed with exactly one role */
+    size_t ambiguous_tokens;      /* tokens whose word took more than one role */
+    double marginal_entropy_bits;
+    double cond_entropy_bits;
+    double cond_entropy_per_word_bits;
+    double mutual_info_bits;
+    int top_ambiguous_word_id;
+    char top_ambiguous_word[64];
+    double top_ambiguous_entropy_bits;
+} RoleEntropyStats;
+
+int triangle_role_entropy(const TriangleChain *chain, RoleEntropyStats *out);
 void free_triangles(TriangleChain *chain);
 void print_triangles(const TriangleChain *chain);
 void print_vocabulary(const TriangleChain *chain);

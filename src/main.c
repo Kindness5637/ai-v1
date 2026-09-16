@@ -79,7 +79,8 @@ typedef struct {
     int target_id;
     int count[3];
     int gold_in[3];
-    int rank[3];
+    int rank[3];      /* gold rank under the eval metric (Euclidean distance) */
+    int dot_rank[3];  /* gold rank under the training objective (dot product) */
     int struct_gold_eligible; /* gold passed pos+trans thresholds (may be truncated) */
     int struct_gold_past_cap; /* eligible but dropped by the candidate buffer cap */
 } UnifiedQueryRecord;
@@ -274,6 +275,45 @@ static int lookup_word_role(const TriangleChain *chain, int word_id) {
         }
     }
     return best;
+}
+
+/* Report how much the role channel adds beyond word identity. See the
+   contract in triangle.h for exactly how each number is computed and what it
+   does NOT account for (context, coverage, usefulness). */
+static void report_role_entropy(const TriangleChain *chain, const char *label) {
+    RoleEntropyStats st;
+    if (triangle_role_entropy(chain, &st) != 0) {
+        fprintf(stderr, "[main] role entropy unavailable for %s\n", label);
+        return;
+    }
+    printf("\n=== Role Information vs Word Identity (%s) ===\n", label);
+    printf("Tagged tokens: %zu | distinct words: %zu\n",
+           st.tokens, st.distinct_words);
+    printf("Words whose role never changes: %zu (%.1f%% of words)\n",
+           st.deterministic_words,
+           st.distinct_words > 0
+               ? 100.0 * (double)st.deterministic_words / (double)st.distinct_words
+               : 0.0);
+    printf("Tokens of role-ambiguous words: %zu (%.1f%% of tagged tokens)\n",
+           st.ambiguous_tokens,
+           st.tokens > 0
+               ? 100.0 * (double)st.ambiguous_tokens / (double)st.tokens : 0.0);
+    printf("H(role)                   = %.4f bits  (marginal)\n",
+           st.marginal_entropy_bits);
+    printf("H(role|word) token-weighted = %.4f bits\n", st.cond_entropy_bits);
+    printf("H(role|word) word-weighted  = %.4f bits\n",
+           st.cond_entropy_per_word_bits);
+    printf("I(role;word)              = %.4f bits  (%.1f%% of H(role))\n",
+           st.mutual_info_bits,
+           st.marginal_entropy_bits > 0.0
+               ? 100.0 * st.mutual_info_bits / st.marginal_entropy_bits : 0.0);
+    printf("Most ambiguous word: '%s' (H(role|w)=%.4f bits, id=%d)\n",
+           st.top_ambiguous_word[0] ? st.top_ambiguous_word : "<none>",
+           st.top_ambiguous_entropy_bits, st.top_ambiguous_word_id);
+    printf("Read: H(role|word) near 0 means the role is derivable from the word\n"
+           "      alone, so role features are largely redundant with the word\n"
+           "      embedding. I(role;word) near H(role) is the opposite.\n");
+    fflush(stdout);
 }
 
 static int has_conllu_suffix(const char *filename) {
@@ -775,15 +815,17 @@ static void write_unified_query_csv(const UnifiedQueryRecord *records,
     fprintf(f, "first_id,second_id,rotation,target_id,pos_threshold,trans_threshold,"
                "exact_count,struct_count,union_count,gold_in_exact,gold_in_struct,"
                "gold_in_union,exact_rank,struct_rank,union_rank,"
+               "exact_dot_rank,struct_dot_rank,union_dot_rank,"
                "struct_gold_eligible,struct_gold_past_cap\n");
     for (size_t q = 0; q < query_count; q++) {
         const UnifiedQueryRecord *r = &records[q];
-        fprintf(f, "%d,%d,%d,%d,%.2f,%llu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+        fprintf(f, "%d,%d,%d,%d,%.2f,%llu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
                 r->first_id, r->second_id, r->rotation, r->target_id,
                 position_threshold, (unsigned long long)transition_threshold,
                 r->count[0], r->count[1], r->count[2],
                 r->gold_in[0], r->gold_in[1], r->gold_in[2],
                 r->rank[0], r->rank[1], r->rank[2],
+                r->dot_rank[0], r->dot_rank[1], r->dot_rank[2],
                 r->struct_gold_eligible, r->struct_gold_past_cap);
     }
     fclose(f);
@@ -874,6 +916,33 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
     long sd_attr_dist = 0, sd_attr_bonus = 0, sd_attr_match = 0;
     int sd_worsened = 0;
     long sd_un_noise_exact = 0, sd_un_noise_struct = 0;
+
+    /* Dual-metric diagnostic: rank the SAME candidate sets by BOTH the
+       training objective and the evaluation metric.
+
+         training   score = output . embedding          (backprop_cuda.cu:109)
+         evaluation score = -||output - embedding||^2
+
+       Expanding the eval metric:
+         -||o - e||^2 = -||o||^2 - ||e||^2 + 2(o.e)
+       ||o||^2 is constant per query, so eval ranking equals
+       dot product MINUS a candidate-norm penalty. The two orderings therefore
+       differ exactly by that penalty, and eval punishes long candidate
+       vectors that training is free to grow. If the two rankings disagree,
+       the model is trained against one objective and graded by another. */
+    int dm_hits[3] = {0, 0, 0};
+    int dm_top1[3] = {0, 0, 0};
+    int dm_top5[3] = {0, 0, 0};
+    double dm_mrr[3] = {0.0, 0.0, 0.0};
+    int dm_improved[3] = {0, 0, 0}, dm_same[3] = {0, 0, 0}, dm_worsened[3] = {0, 0, 0};
+    int dm_gain_rank1[3] = {0, 0, 0}, dm_lost_rank1[3] = {0, 0, 0};
+    /* Embedding-norm evidence for the mismatch mechanism: training (dot) is
+       free to grow candidate norms; eval (Euclid) penalises them. If gold
+       norms are systematically smaller than outranker norms, the penalty is
+       what buries gold. STRUCT hits (mode 1) only; SCORER_DIAG-gated. */
+    double dm_gold_norm_sum = 0.0, dm_out_norm_sum = 0.0;
+    double dm_gold_norm_max = 0.0, dm_out_norm_max = 0.0;
+    long dm_gold_norm_n = 0, dm_out_norm_n = 0;
     FILE *sd_csv = NULL;
     if (scorer_diag) {
         mkdir("results", 0755);
@@ -930,6 +999,7 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
             rec->count[mode] = (int)count;
             rec->gold_in[mode] = 0;
             rec->rank[mode] = -1;
+            rec->dot_rank[mode] = -1;
 
             metrics[mode].total_candidates += count;
             if (count > 0) metrics[mode].nonempty_queries++;
@@ -942,24 +1012,32 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
             double target_score = -INFINITY;
             int found = 0;
             double gold_dist = 0.0, gold_bonus = 0.0, gold_match = 0.0;
+            double gold_dot = 0.0;
             double cand_dist[1024];
+            double cand_dot[1024];
             double cand_match0[1024];
             for (size_t c = 0; c < count; c++) {
                 int candidate_id = candidates[c].word_id;
                 cand_dist[c] = 0.0;
+                cand_dot[c] = -INFINITY;   /* invalid entries must not rank */
                 /* keep the ORIGINAL match_score: it is overwritten with the
                    full score below, but the attribution needs the raw term */
                 cand_match0[c] = candidates[c].match_score;
                 if (candidate_id <= 0 || candidate_id > vocab_size) continue;
 
                 double distance = 0.0;
+                double dot = 0.0;
                 int target_start = query->target_position * embed_dim;
                 for (int d = 0; d < embed_dim; d++) {
-                    double delta = output[target_start + d] -
+                    double predicted = output[target_start + d];
+                    double embedded =
                         trainer->network->embeddings[(candidate_id - 1) * embed_dim + d];
+                    double delta = predicted - embedded;
                     distance += delta * delta;
+                    dot += predicted * embedded;   /* training's objective */
                 }
                 cand_dist[c] = distance;
+                cand_dot[c] = dot;
 
                 double score = -distance +
                     0.75 * log(1.0 + candidates[c].occurrence_count) +
@@ -971,6 +1049,7 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
                     found = 1;
                     target_score = score;
                     gold_dist = distance;
+                    gold_dot = dot;
                     gold_bonus = 0.75 * log(1.0 + candidates[c].occurrence_count) +
                                  0.50 * log(1.0 + candidates[c].neighbor_count);
                     gold_match = cand_match0[c];
@@ -987,6 +1066,27 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
                     if (candidates[c].match_score > target_score) rank++;
                 }
                 rec->rank[mode] = rank;
+
+                /* Dual-metric: rank the SAME candidate set by dot product --
+                   the objective training optimised -- and compare it with the
+                   Euclidean ranking above. Same validity guard as the rank
+                   loop so invalid entries cannot outrank gold. */
+                int dot_rank = 0;
+                for (size_t c = 0; c < count; c++) {
+                    int candidate_id = candidates[c].word_id;
+                    if (candidate_id <= 0 || candidate_id > vocab_size) continue;
+                    if (cand_dot[c] > gold_dot) dot_rank++;
+                }
+                rec->dot_rank[mode] = dot_rank;
+                dm_hits[mode]++;
+                if (dot_rank == 0) dm_top1[mode]++;
+                if (dot_rank < 5) dm_top5[mode]++;
+                dm_mrr[mode] += 1.0 / (dot_rank + 1);
+                if (dot_rank < rank) dm_improved[mode]++;
+                else if (dot_rank == rank) dm_same[mode]++;
+                else dm_worsened[mode]++;
+                if (rank != 0 && dot_rank == 0) dm_gain_rank1[mode]++;
+                if (rank == 0 && dot_rank != 0) dm_lost_rank1[mode]++;
 
                 if (scorer_diag) {
                     if (mode == 1) {
@@ -1033,6 +1133,37 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
                                     (unsigned long long)transition_threshold,
                                     rank, gold_dist, gold_bonus, gold_match,
                                     n_out, n_dist, n_bonus, n_match);
+                        /* Norm evidence: ||gold|| vs ||outrankers|| in the same
+                           embedding space eval ranks by. Accumulate over STRUCT
+                           hits only; unconditional math, printed only in the
+                           diag block so default output is byte-identical. */
+                        {
+                            double gn2 = 0.0;
+                            if (query->target_id > 0 && query->target_id <= vocab_size) {
+                                const double *ge = trainer->network->embeddings +
+                                    (size_t)(query->target_id - 1) * (size_t)embed_dim;
+                                for (int d = 0; d < embed_dim; d++)
+                                    gn2 += ge[d] * ge[d];
+                            }
+                            double gn = sqrt(gn2);
+                            dm_gold_norm_sum += gn;
+                            if (gn > dm_gold_norm_max) dm_gold_norm_max = gn;
+                            dm_gold_norm_n++;
+                            for (size_t c = 0; c < count; c++) {
+                                int candidate_id = candidates[c].word_id;
+                                if (candidate_id <= 0 || candidate_id > vocab_size) continue;
+                                if (candidates[c].match_score <= target_score) continue;
+                                const double *ce = trainer->network->embeddings +
+                                    (size_t)(candidate_id - 1) * (size_t)embed_dim;
+                                double cn2 = 0.0;
+                                for (int d = 0; d < embed_dim; d++)
+                                    cn2 += ce[d] * ce[d];
+                                double cn = sqrt(cn2);
+                                dm_out_norm_sum += cn;
+                                if (cn > dm_out_norm_max) dm_out_norm_max = cn;
+                                dm_out_norm_n++;
+                            }
+                        }
                     } else if (mode == 2 && rec->rank[1] >= 0 &&
                                rank > rec->rank[1]) {
                         /* Worsened by UNION: are the new outrankers of gold
@@ -1153,6 +1284,48 @@ static void run_unified_candidate_evaluation(const BackpropTrainer *trainer,
                m->query_count > 0 ? 100.0 * m->cap_hit_queries / m->query_count : 0.0);
     }
     printf("==========================================================================\n");
+
+    /* Dual-metric report: identical candidate sets, ranked two ways. Both
+       columns use the SAME denominator (hits = queries where gold was
+       present), so the two metrics are directly comparable to each other --
+       but NOT to the CandRecall column in the table above, which is over all
+       queries. */
+    if (scorer_diag) {
+    printf("\n=== Ranking Metric: Training Objective vs Evaluation Metric ===\n");
+    printf("%-8s %-7s %-24s %-24s\n", "Mode", "Hits",
+           "Euclid R@1/R@5/MRR", "DotProd R@1/R@5/MRR");
+    printf("----------------------------------------------------------------------------------\n");
+    for (int mode = 0; mode < 3; mode++) {
+        int h = dm_hits[mode];
+        printf("%-8s %-7d %.1f%%/%.1f%%/%.4f      %.1f%%/%.1f%%/%.4f\n",
+               metrics[mode].name,
+               h,
+               h > 0 ? 100.0 * metrics[mode].top1 / h : 0.0,
+               h > 0 ? 100.0 * metrics[mode].top5 / h : 0.0,
+               h > 0 ? metrics[mode].mrr_sum / h : 0.0,
+               h > 0 ? 100.0 * dm_top1[mode] / h : 0.0,
+               h > 0 ? 100.0 * dm_top5[mode] / h : 0.0,
+               h > 0 ? dm_mrr[mode] / h : 0.0);
+    }
+    printf("Rank movement (Euclid -> dot, per mode: improved/same/worsened/r1+/r1-):\n");
+    static const char *dm_names[3] = { "EXACT", "STRUCT", "UNION" };
+    for (int mode = 0; mode < 3; mode++)
+        printf("  %-8s %+d/%d/%+d  gained_r1=%d lost_r1=%d\n", dm_names[mode],
+                dm_improved[mode], dm_same[mode], dm_worsened[mode],
+                dm_gain_rank1[mode], dm_lost_rank1[mode]);
+    if (scorer_diag) {
+        printf("Embedding norms over STRUCT hits (eval penalises large ||e||):\n");
+        printf("  gold       mean=%.4f max=%.4f (n=%ld)\n",
+                dm_gold_norm_n > 0 ? dm_gold_norm_sum / (double)dm_gold_norm_n : 0.0,
+                dm_gold_norm_max, dm_gold_norm_n);
+        printf("  outrankers mean=%.4f max=%.4f (n=%ld)\n",
+                dm_out_norm_n > 0 ? dm_out_norm_sum / (double)dm_out_norm_n : 0.0,
+                dm_out_norm_max, dm_out_norm_n);
+        printf("  Read: outranker mean >> gold mean supports the norm-penalty mechanism\n"
+               "  (training grows ||e||, eval punishes it).\n");
+    }
+    printf("==========================================================================\n");
+    } /* end SCORER_DIAG-gated dual-metric + norm report */
 
     static const char *bucket_names[4] = {
         "A: EXACT-only", "B: STRUCT-only", "C: EXACT+STRUCT", "D: neither"
@@ -2395,6 +2568,9 @@ int main(int argc, char *argv[]) {
                 if (use_mode_b && rel_reg) {
                     printf("\n=== Running in Unsupervised Discovery Mode (Mode B) ===\n");
                     relational_registry_report(rel_reg, shared_vocab, 15);
+                    /* Corpus statistic: decides whether role features can add
+                       anything beyond the word identity already present. */
+                    report_role_entropy(train_chain, "training chain");
                 } else {
                     printf("\n=== Running in Supervised Baseline Mode (Mode A) ===\n");
                 }

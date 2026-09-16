@@ -13,6 +13,8 @@ CUDA_OUT = triangle_cuda.out
 
 TEST_OUT = tests/test_role_ids.out
 TEST_SRC = tests/test_role_ids.c src/core/triangle.c src/core/word.c
+TEST2_OUT = tests/test_role_entropy.out
+TEST2_SRC = tests/test_role_entropy.c src/core/triangle.c src/core/word.c
 
 all: $(OUT)
 
@@ -21,14 +23,18 @@ $(OUT): $(SRC)
 
 # Adversarial tests for the UPOS role plumbing. -Isrc is needed because the
 # test lives in tests/ and resolves "core/..." relative to the source tree.
-test: $(TEST_OUT)
+test: $(TEST_OUT) $(TEST2_OUT)
 	./$(TEST_OUT)
+	./$(TEST2_OUT)
 
 $(TEST_OUT): $(TEST_SRC)
 	$(CC) $(CFLAGS) -Isrc -o $@ $^ $(LDFLAGS)
 
+$(TEST2_OUT): $(TEST2_SRC)
+	$(CC) $(CFLAGS) -Isrc -o $@ $^ $(LDFLAGS)
+
 clean:
-	rm -f $(OUT) $(CUDA_OUT) $(CUDA_C) $(CUDA_O) $(TEST_OUT)
+	rm -f $(OUT) $(CUDA_OUT) $(CUDA_C) $(CUDA_O) $(TEST_OUT) $(TEST2_OUT)
 
 cuda: $(CUDA_OUT)
 

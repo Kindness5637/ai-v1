@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 
 static char **tokenize(const char *sentence, size_t *word_count) {
     char *copy = strdup(sentence);
@@ -58,6 +59,99 @@ int triangle_role_id(const char *upos) {
     for (int i = 1; i < (int)(sizeof(roles) / sizeof(roles[0])); i++) {
         if (strcmp(upos, roles[i]) == 0) return i;
     }
+    return 0;
+}
+
+/* Shannon entropy in bits of a count distribution over `n` bins. */
+static double entropy_bits(const size_t *counts, size_t n, size_t total) {
+    if (total == 0) return 0.0;
+    double h = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        if (counts[i] == 0) continue;
+        double p = (double)counts[i] / (double)total;
+        h -= p * (log(p) / log(2.0));
+    }
+    return h;
+}
+
+int triangle_role_entropy(const TriangleChain *chain, RoleEntropyStats *out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    if (!chain || !chain->vocab) return -1;
+
+    size_t vocab_size = chain->vocab->count;
+    if (vocab_size == 0) return -1;
+
+    size_t cells = (vocab_size + 1) * TRIANGLE_ROLE_FEATURE_DIM;
+    size_t *joint = (size_t *)calloc(cells, sizeof(size_t));
+    size_t *per_word = (size_t *)calloc(vocab_size + 1, sizeof(size_t));
+    size_t *per_role = (size_t *)calloc(TRIANGLE_ROLE_FEATURE_DIM, sizeof(size_t));
+    if (!joint || !per_word || !per_role) {
+        fprintf(stderr, "triangle_role_entropy: allocation failed\n");
+        free(joint);
+        free(per_word);
+        free(per_role);
+        return -1;
+    }
+
+    size_t tokens = 0;
+    for (size_t t = 0; t < chain->count; t++) {
+        for (int p = 0; p < 3; p++) {
+            int word = chain->triangles[t].word_ids[p];
+            int role = chain->triangles[t].role_ids[p];
+            if (word <= 0 || word > (int)vocab_size) continue;
+            if (role <= 0 || role >= TRIANGLE_ROLE_FEATURE_DIM) continue; /* holding */
+            joint[(size_t)word * TRIANGLE_ROLE_FEATURE_DIM + (size_t)role]++;
+            per_word[word]++;
+            per_role[role]++;
+            tokens++;
+        }
+    }
+    out->tokens = tokens;
+    if (tokens == 0) {
+        free(joint);
+        free(per_word);
+        free(per_role);
+        return 0;
+    }
+
+    out->marginal_entropy_bits =
+        entropy_bits(per_role, TRIANGLE_ROLE_FEATURE_DIM, tokens);
+
+    for (size_t w = 1; w <= vocab_size; w++) {
+        if (per_word[w] == 0) continue;
+        const size_t *row = &joint[w * TRIANGLE_ROLE_FEATURE_DIM];
+        double h_w = entropy_bits(row, TRIANGLE_ROLE_FEATURE_DIM, per_word[w]);
+        size_t roles_taken = 0;
+        for (int r = 0; r < TRIANGLE_ROLE_FEATURE_DIM; r++) {
+            if (row[r] > 0) roles_taken++;
+        }
+        out->distinct_words++;
+        if (roles_taken == 1) out->deterministic_words++;
+        else out->ambiguous_tokens += per_word[w];
+        out->cond_entropy_bits += ((double)per_word[w] / (double)tokens) * h_w;
+        out->cond_entropy_per_word_bits += h_w;
+        if (h_w > out->top_ambiguous_entropy_bits) {
+            out->top_ambiguous_entropy_bits = h_w;
+            out->top_ambiguous_word_id = (int)w;
+            const char *text = vocab_get_word(chain->vocab, (int)w);
+            if (text) {
+                strncpy(out->top_ambiguous_word, text,
+                        sizeof(out->top_ambiguous_word) - 1);
+                out->top_ambiguous_word[sizeof(out->top_ambiguous_word) - 1] = '\0';
+            }
+        }
+    }
+
+    if (out->distinct_words > 0) {
+        out->cond_entropy_per_word_bits /= (double)out->distinct_words;
+    }
+    out->mutual_info_bits =
+        out->marginal_entropy_bits - out->cond_entropy_bits;
+
+    free(joint);
+    free(per_word);
+    free(per_role);
     return 0;
 }
 
