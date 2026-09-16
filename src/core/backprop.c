@@ -308,7 +308,11 @@ int backprop_predict(BackpropTrainer *trainer, double *input, double *output) {
         for (int h = 0; h < nn->hidden_size; h++) {
             output[o] += hidden[h] * nn->weights_ho[h * nn->output_size + o];
         }
-        output[o] = sigmoid(output[o] + nn->bias_o[o]);
+        /* Training uses a linear decoder and compares its output directly
+         * with embedding vectors. Applying sigmoid here puts predictions in
+         * [0,1], while normalized embeddings may be negative, making nearest
+         * neighbor evaluation inconsistent with the trained objective. */
+        output[o] += nn->bias_o[o];
     }
 
     free(hidden);
