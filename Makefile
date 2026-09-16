@@ -11,13 +11,24 @@ CUDA_C = $(CUDA_SRC:.c=.cuda.o)
 CUDA_O = src/core/backprop_cuda.cuda.o src/core/eval_cuda.cuda.o
 CUDA_OUT = triangle_cuda.out
 
+TEST_OUT = tests/test_role_ids.out
+TEST_SRC = tests/test_role_ids.c src/core/triangle.c src/core/word.c
+
 all: $(OUT)
 
 $(OUT): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# Adversarial tests for the UPOS role plumbing. -Isrc is needed because the
+# test lives in tests/ and resolves "core/..." relative to the source tree.
+test: $(TEST_OUT)
+	./$(TEST_OUT)
+
+$(TEST_OUT): $(TEST_SRC)
+	$(CC) $(CFLAGS) -Isrc -o $@ $^ $(LDFLAGS)
+
 clean:
-	rm -f $(OUT) $(CUDA_OUT) $(CUDA_C) $(CUDA_O)
+	rm -f $(OUT) $(CUDA_OUT) $(CUDA_C) $(CUDA_O) $(TEST_OUT)
 
 cuda: $(CUDA_OUT)
 
@@ -33,4 +44,4 @@ src/core/backprop_cuda.cuda.o: src/core/backprop_cuda.cu
 src/core/eval_cuda.cuda.o: src/core/eval_cuda.cu
 	$(CUDA) $(CUDA_FLAGS) -c -o $@ $<
 
-.PHONY: all clean cuda
+.PHONY: all clean cuda test
