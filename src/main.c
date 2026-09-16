@@ -252,6 +252,75 @@ static int run_gpu_evaluation_only(const TriangleChain *chain,
     return 0;
 }
 
+static void run_neural_evaluation_only(const BackpropTrainer *trainer,
+                                       const TriangleChain *chain,
+                                       size_t limit) {
+    if (!trainer || !trainer->network || !chain) return;
+    if (limit > chain->count) limit = chain->count;
+
+    BackpropTrainer *mutable_trainer = (BackpropTrainer *)trainer;
+    double *input = calloc(trainer->network->input_size, sizeof(double));
+    double *output = calloc(trainer->network->output_size, sizeof(double));
+    if (!input || !output) {
+        free(input);
+        free(output);
+        return;
+    }
+
+    int total = 0, top1 = 0, top5 = 0;
+    int vocab_size = trainer->network->vocab_size;
+    int embed_dim = trainer->network->embed_dim;
+    for (size_t t = 0; t < limit; t++) {
+        for (int rotation = 0; rotation < 3; rotation++) {
+            int first_id = chain->triangles[t].word_ids[rotation];
+            int second_id = chain->triangles[t].word_ids[(rotation + 1) % 3];
+            int target_id = chain->triangles[t].word_ids[(rotation + 2) % 3];
+            if (target_id <= 0 || target_id > vocab_size) continue;
+
+            memset(input, 0, trainer->network->input_size * sizeof(double));
+            fill_model_input(input, 0, first_id, 0, trainer->network);
+            fill_model_input(input, 1, second_id, 0, trainer->network);
+            backprop_predict(mutable_trainer, input, output);
+
+            int best_ids[5] = {-1, -1, -1, -1, -1};
+            double best_distances[5] = {INFINITY, INFINITY, INFINITY, INFINITY, INFINITY};
+            int target_start = ((rotation + 2) % 3) * embed_dim;
+            for (int word = 1; word <= vocab_size; word++) {
+                double distance = 0.0;
+                for (int d = 0; d < embed_dim; d++) {
+                    double delta = output[target_start + d] -
+                        trainer->network->embeddings[(word - 1) * embed_dim + d];
+                    distance += delta * delta;
+                }
+                for (int rank = 0; rank < 5; rank++) {
+                    if (distance >= best_distances[rank]) continue;
+                    for (int shift = 4; shift > rank; shift--) {
+                        best_distances[shift] = best_distances[shift - 1];
+                        best_ids[shift] = best_ids[shift - 1];
+                    }
+                    best_distances[rank] = distance;
+                    best_ids[rank] = word;
+                    break;
+                }
+            }
+            total++;
+            if (best_ids[0] == target_id) top1++;
+            for (int rank = 0; rank < 5; rank++) {
+                if (best_ids[rank] == target_id) {
+                    top5++;
+                    break;
+                }
+            }
+        }
+    }
+    printf("\n=== Neural Held-out Evaluation (%d queries) ===\n", total);
+    printf("Neural top-1: %.1f%%\n", total > 0 ? 100.0 * top1 / total : 0.0);
+    printf("Neural top-5: %.1f%%\n", total > 0 ? 100.0 * top5 / total : 0.0);
+    fflush(stdout);
+    free(input);
+    free(output);
+}
+
 static void evaluate_context_model(BackpropTrainer *trainer,
                                    const TriangleChain *chain,
                                    const ContextGraph *graph,
@@ -1412,6 +1481,7 @@ int main(int argc, char *argv[]) {
                         fprintf(stderr, "[main] GPU_EVAL_ONLY enabled\n");
                         if (run_gpu_evaluation_only(test_chain, train_graph, rel_reg, 100) != 0)
                             fprintf(stderr, "[main] GPU evaluation failed\n");
+                        run_neural_evaluation_only(trainer, test_chain, 100);
                     } else {
                         evaluate_context_model(trainer, test_chain, train_graph, rel_reg, use_mode_b, 100);
                         fprintf(stderr, "[main] context evaluation returned\n");
